@@ -5,6 +5,7 @@ package com.droid.wayfinder.qa
 
 import android.app.DownloadManager
 import androidx.activity.ComponentActivity
+import androidx.compose.ui.semantics.getOrNull
 import androidx.compose.ui.test.ExperimentalTestApi
 import androidx.compose.ui.test.assert
 import androidx.compose.ui.test.assertHeightIsAtLeast
@@ -303,6 +304,24 @@ class DialogsUiTest {
         val ebValBounds = rule.onNodeWithText("+0.3 EV").fetchSemanticsNode().boundsInRoot
         assertEquals(sizeValBounds.left, wbValBounds.left, 1f)
         assertEquals(sizeValBounds.left, ebValBounds.left, 1f)
+
+        // Section headers expose TalkBack heading semantics; mono values force TextDirection.Ltr.
+        for (headingText in listOf("Image & EXIF", "Checksums")) {
+            val headingNode = rule.onNodeWithText(headingText).fetchSemanticsNode()
+            assertTrue(
+                "Expected $headingText to expose SemanticsProperties.Heading",
+                androidx.compose.ui.semantics.SemanticsProperties.Heading in headingNode.config,
+            )
+        }
+        val monoLayouts = mutableListOf<androidx.compose.ui.text.TextLayoutResult>()
+        val fetched = rule.onNodeWithText("+0.3 EV").fetchSemanticsNode()
+            .config.getOrNull(androidx.compose.ui.semantics.SemanticsActions.GetTextLayoutResult)
+            ?.action?.invoke(monoLayouts)
+        assertEquals(true, fetched)
+        assertEquals(
+            androidx.compose.ui.text.style.TextDirection.Ltr,
+            monoLayouts.single().layoutInput.style.textDirection,
+        )
 
         // Copyable rows and section headers preserve >= 48dp touch targets and emit CopyText.
         for (desc in listOf("Copy Path", "Copy Location", "Copy SHA-256", "Copy CRC32", "Copy EXIF info")) {

@@ -238,6 +238,12 @@
     <string name="dialog_password_label" description="Text field label for the account password in the server authentication dialog. [CHAR_LIMIT=25]">Password</string>
     <string name="dialog_domain_optional_label" description="Text field label for the optional SMB domain or workgroup in the authentication dialog. [CHAR_LIMIT=45]">Domain / workgroup (optional)</string>
     <string name="dialog_remember_password" description="Checkbox label in the server authentication dialog to encrypt and save the password in Android Keystore. [CHAR_LIMIT=55]">Remember password (stored encrypted)</string>
+    <string name="properties_name_label" description="Row label in the Properties dialog for the item's filename. [CHAR_LIMIT=20]">Name</string>
+    <string name="properties_kind_label" description="Row label in the Properties dialog for the item's file type description. [CHAR_LIMIT=20]">Kind</string>
+    <string name="properties_modified_label" description="Row label in the Properties dialog for the item's last-modified timestamp. [CHAR_LIMIT=20]">Modified</string>
+    <string name="properties_path_label" description="Row label in the Properties dialog for the item's full path. [CHAR_LIMIT=20]">Path</string>
+    <string name="properties_posix_section" description="Section heading in the Properties dialog above POSIX file mode, inode, link count, and uid/gid metadata. [CHAR_LIMIT=25]">POSIX</string>
+    <string name="properties_copy_field" description="Accessibility label and hover tooltip for a button that copies a single property value in the Properties dialog. %1$s is the property label (e.g. Path, SHA-256). [CHAR_LIMIT=35]">Copy %1$s</string>
     <string name="properties_size_label" description="Row label in the Properties dialog for total byte size. [CHAR_LIMIT=20]">Size</string>
     <string name="properties_files_label" description="Row label in the Properties dialog for descendant file count. [CHAR_LIMIT=20]">Files</string>
     <string name="properties_contains_label" description="Row label in the Properties dialog summarizing selected folders and files. [CHAR_LIMIT=20]">Contains</string>

@@ -59,9 +59,13 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.semantics.heading
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.window.DialogProperties
 import androidx.compose.ui.text.TextRange
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.style.TextDirection
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -176,11 +180,14 @@ private fun NameDialog(
 }
 
 private val PROPERTIES_LABEL_WIDTH = 116.dp
-private const val PROPERTIES_STACK_WIDTH_THRESHOLD_DP = 340f
-private const val PROPERTIES_STACK_FONT_SCALE_THRESHOLD = 1.3f
+private const val PROPERTIES_STACK_WIDTH_THRESHOLD_DP = 380f
+private const val PROPERTIES_STACK_FONT_SCALE_THRESHOLD = 1.2f
 
 internal fun shouldStackPropertiesRows(availableWidthDp: Float, fontScale: Float): Boolean =
     availableWidthDp < PROPERTIES_STACK_WIDTH_THRESHOLD_DP || fontScale > PROPERTIES_STACK_FONT_SCALE_THRESHOLD
+
+internal fun propertiesValueTextStyle(base: TextStyle, mono: Boolean): TextStyle =
+    if (mono) base.copy(fontFamily = FontFamily.Monospace, textDirection = TextDirection.Ltr) else base
 
 private val LocalPropertiesStacked = compositionLocalOf { false }
 
@@ -202,9 +209,9 @@ private fun PropertiesDialog(d: Dialog.Properties, s: AppState, onDismiss: () ->
                         verticalArrangement = Arrangement.spacedBy(6.dp),
                     ) {
                         if (e.size == 1) {
-                            Row2("Name", e[0].name)
-                            Row2("Kind", e[0].typeLabel)
-                            Row2("Modified", formatDateFull(e[0].modified))
+                            Row2(stringResource(R.string.properties_name_label), e[0].name)
+                            Row2(stringResource(R.string.properties_kind_label), e[0].typeLabel)
+                            Row2(stringResource(R.string.properties_modified_label), formatDateFull(e[0].modified))
                         }
                         Row2(stringResource(R.string.properties_size_label), d.bytes?.let { "${formatSize(it)} (${icuStringResource(R.string.byte_count_plural, it)})" } ?: stringResource(R.string.properties_calculating))
                         d.items?.let { if (e.size > 1 || e[0].isDir) Row2(stringResource(R.string.properties_files_label), formatLocalizedNumber(it.toLong())) }
@@ -221,10 +228,11 @@ private fun PropertiesDialog(d: Dialog.Properties, s: AppState, onDismiss: () ->
                         }
                         if (e.size == 1) {
                             val shownPath = if (FsPath.isDoc(e[0].path) || FsPath.isPhone(e[0].path)) s.displayPath(e[0].path, "/") else e[0].path
-                            Row2("Path", shownPath, mono = true) { onCopy(shownPath, "Path") }
+                            val pathLabel = stringResource(R.string.properties_path_label)
+                            Row2(pathLabel, shownPath, mono = true) { onCopy(shownPath, pathLabel) }
                         }
                         d.posix?.let { p ->
-                            PropertiesSectionHeader("POSIX")
+                            PropertiesSectionHeader(stringResource(R.string.properties_posix_section))
                             Row2(stringResource(R.string.properties_permissions_label), "${FileInfo.posixString(p.mode)}  (${FileInfo.octal(p.mode)})", mono = true)
                             Row2(stringResource(R.string.properties_inode_label), p.inode.toString(), mono = true)
                             Row2(stringResource(R.string.properties_links_label), p.links.toString(), mono = true)
@@ -268,7 +276,12 @@ private fun PropertiesSectionHeader(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween,
             ) {
-                Text(title, style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
+                Text(
+                    title,
+                    Modifier.semantics { heading() },
+                    style = MaterialTheme.typography.labelLarge,
+                    color = MaterialTheme.colorScheme.primary,
+                )
                 ActionTooltip(copyDescription) {
                     IconButton(
                         onClick = onCopy,
@@ -281,7 +294,7 @@ private fun PropertiesSectionHeader(
         } else {
             Text(
                 title,
-                Modifier.padding(top = 12.dp, bottom = 4.dp),
+                Modifier.padding(top = 12.dp, bottom = 4.dp).semantics { heading() },
                 style = MaterialTheme.typography.labelLarge,
                 color = MaterialTheme.colorScheme.primary,
             )
@@ -447,12 +460,11 @@ private fun Row2(label: String, value: String, mono: Boolean = false, onCopy: ((
                     ) {
                         Text(
                             value,
-                            style = MaterialTheme.typography.bodySmall,
-                            fontFamily = if (mono) FontFamily.Monospace else null,
+                            style = propertiesValueTextStyle(MaterialTheme.typography.bodySmall, mono),
                             color = MaterialTheme.colorScheme.onSurface,
                         )
                     }
-                    val copyLabel = "Copy $label"
+                    val copyLabel = stringResource(R.string.properties_copy_field, label)
                     ActionTooltip(copyLabel) {
                         IconButton(
                             onClick = onCopy,
@@ -466,11 +478,12 @@ private fun Row2(label: String, value: String, mono: Boolean = false, onCopy: ((
         }
         return
     }
+    val valueStyle = propertiesValueTextStyle(MaterialTheme.typography.bodyMedium, mono)
     if (LocalPropertiesStacked.current) {
         Column(Modifier.fillMaxWidth().padding(vertical = 2.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
             Text(label, color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.labelMedium)
             androidx.compose.foundation.text.selection.SelectionContainer(Modifier.fillMaxWidth()) {
-                Text(value, style = MaterialTheme.typography.bodyMedium, fontFamily = if (mono) FontFamily.Monospace else null)
+                Text(value, style = valueStyle)
             }
         }
         return
@@ -487,7 +500,7 @@ private fun Row2(label: String, value: String, mono: Boolean = false, onCopy: ((
             style = MaterialTheme.typography.bodyMedium,
         )
         androidx.compose.foundation.text.selection.SelectionContainer(Modifier.weight(1f)) {
-            Text(value, style = MaterialTheme.typography.bodyMedium, fontFamily = if (mono) FontFamily.Monospace else null)
+            Text(value, style = valueStyle)
         }
     }
 }
