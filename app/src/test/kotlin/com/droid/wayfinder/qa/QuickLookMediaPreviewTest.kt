@@ -18,7 +18,10 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.ui.test.ExperimentalTestApi
+import androidx.compose.ui.test.SemanticsMatcher
+import androidx.compose.ui.test.assert
 import androidx.compose.ui.test.assertHeightIsAtLeast
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertWidthIsAtLeast
@@ -31,8 +34,10 @@ import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performKeyInput
 import androidx.compose.ui.test.pressKey
+import androidx.compose.ui.test.requestFocus
 import androidx.compose.ui.test.withKeyDown
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.Lifecycle
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
@@ -41,11 +46,15 @@ import androidx.media3.common.Player
 import androidx.media3.common.SimpleBasePlayer
 import androidx.media3.common.VideoSize
 import androidx.media3.common.util.UnstableApi
+import androidx.media3.datasource.DataSpec
 import androidx.test.ext.junit.runners.AndroidJUnit4
+import com.droid.wayfinder.data.FileEntry
 import com.droid.wayfinder.ui.AppRoot
 import com.droid.wayfinder.ui.Dialog
 import com.droid.wayfinder.ui.MenuEntry
+import com.droid.wayfinder.ui.PreviewPane
 import com.droid.wayfinder.ui.QuickLook
+import com.droid.wayfinder.ui.createLocalOnlyDataSourceFactory
 import com.droid.wayfinder.ui.fileMenu
 import com.droid.wayfinder.ui.paletteCommands
 import com.droid.wayfinder.ui.quickLookAnimatedDrawableFactory
@@ -53,11 +62,13 @@ import com.droid.wayfinder.ui.quickLookMediaPlayerFactory
 import com.droid.wayfinder.ui.theme.WayfinderTheme
 import com.google.common.util.concurrent.Futures
 import com.google.common.util.concurrent.ListenableFuture
+import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Rule
@@ -66,6 +77,11 @@ import org.junit.runner.RunWith
 import org.robolectric.annotation.Config
 import org.robolectric.annotation.GraphicsMode
 import java.io.ByteArrayOutputStream
+import java.io.File
+import java.io.IOException
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.nio.file.Files
 
 @OptIn(UnstableApi::class)
 @kotlin.OptIn(ExperimentalTestApi::class)
@@ -572,5 +588,271 @@ class QuickLookMediaPreviewTest {
         assertEquals(64, decoded!!.width)
         assertEquals(64, decoded.height)
         assertNull(com.droid.wayfinder.data.MediaPreviewLoader.decodeArtworkBitmap("corrupt-image".toByteArray()))
+    }
+
+    @Test
+    fun localOnlyDataSourceRejectsNetworkSchemesSymlinksAndNonRegularFiles() {
+        val harness = VmHarness().also { h = it }
+        val factory = createLocalOnlyDataSourceFactory(harness.app)
+
+        for (blockedUri in listOf(
+            "http://127.0.0.1:8080/playlist.m3u8",
+            "https://example.com/stream.mp4",
+            "rtsp://example.com/live",
+            "asset:///bundled.mp4",
+            "data:audio/mp3;base64,AAAA",
+        )) {
+            val ds = factory.createDataSource()
+            assertThrows("Expected $blockedUri to be rejected", IOException::class.java) {
+                ds.open(DataSpec(android.net.Uri.parse(blockedUri)))
+            }
+        }
+
+        val regular = harness.file("ds/clip.mp4", "regular-payload")
+        val sym = File(harness.dir("ds"), "sym_clip.mp4")
+        val symCreated = runCatching { Files.createSymbolicLink(sym.toPath(), regular.toPath()); true }.getOrDefault(false)
+        if (symCreated) {
+            val symDs = factory.createDataSource()
+            assertThrows("Expected symlink file:// URI to be rejected", IOException::class.java) {
+                symDs.open(DataSpec(android.net.Uri.fromFile(sym)))
+            }
+        }
+
+        val okDs = factory.createDataSource()
+        try {
+            val openedLen = okDs.open(DataSpec(android.net.Uri.fromFile(regular)))
+            assertEquals(regular.length(), openedLen)
+            val buf = ByteArray(32)
+            val n = okDs.read(buf, 0, buf.size)
+            assertEquals("regular-payload", String(buf, 0, n, Charsets.UTF_8))
+        } finally {
+            okDs.close()
+        }
+    }
+
+    @Test
+    fun symlinkAndPrivateAppFilesAreBlockedInQuickLookPreviewPaneAndResolvePreviewUri() {
+        val harness = VmHarness().also { h = it }
+        val privateSecret = File(harness.app.applicationInfo.dataDir, "secret_token.txt").apply {
+            parentFile?.mkdirs()
+            writeText("TOP_SECRET_TOKEN_991")
+        }
+        val privateEntry = FileEntry(
+            path = privateSecret.path,
+            name = privateSecret.name,
+            isDir = false,
+            size = privateSecret.length(),
+            modified = privateSecret.lastModified(),
+        )
+        assertFalse(harness.vm.isSafeLocalRegularFile(privateEntry))
+        assertNull(runBlocking { harness.vm.resolvePreviewUri(privateEntry) })
+
+        val jailDir = harness.dir("jail")
+        harness.file("jail/safe.txt", "safe-public-text")
+        val symTxt = File(jailDir, "leak.txt")
+        val symImg = File(jailDir, "leak.jpg")
+        val symCreated = runCatching {
+            Files.createSymbolicLink(symTxt.toPath(), privateSecret.toPath())
+            Files.createSymbolicLink(symImg.toPath(), privateSecret.toPath())
+            true
+        }.getOrDefault(false)
+
+        harness.navigate(jailDir.path)
+
+        if (symCreated) {
+            val leakTxtEntry = harness.s.active.entries.single { it.name == "leak.txt" }
+            val leakImgEntry = harness.s.active.entries.single { it.name == "leak.jpg" }
+            assertFalse(harness.vm.isSafeLocalRegularFile(leakTxtEntry))
+            assertNull(runBlocking { harness.vm.resolvePreviewUri(leakTxtEntry) })
+            assertNull(runBlocking { harness.vm.thumbnailSource(leakImgEntry) })
+
+            harness.select("jail/leak.txt")
+            harness.vm.toggleQuickLook()
+            harness.settle()
+
+            rule.setContent {
+                val s by harness.vm.state.collectAsState()
+                WayfinderTheme(false) {
+                    PreviewPane(harness.vm, s, Modifier.size(width = 300.dp, height = 600.dp))
+                    QuickLook(harness.vm, s)
+                }
+            }
+            idle(harness)
+            rule.waitUntil(5_000) {
+                rule.onAllNodesWithText("This file can't be previewed safely in Quick Look.").fetchSemanticsNodes().isNotEmpty()
+            }
+            assertEquals(
+                "Private symlink contents must never render in QuickLook or PreviewPane",
+                0,
+                rule.onAllNodesWithText("TOP_SECRET_TOKEN_991", substring = true).fetchSemanticsNodes().size,
+            )
+        }
+    }
+
+    @Test
+    fun systemBackAndKeyBackDismissQuickLookWithoutNavigatingUnderlyingFolder() {
+        val harness = VmHarness().also { h = it }
+        val parentDir = harness.dir("back_parent")
+        val childDir = harness.dir("back_parent/child")
+        harness.file("back_parent/child/demo.mp4", "video")
+        harness.navigate(parentDir.path)
+        harness.navigate(childDir.path)
+        assertTrue(harness.s.active.canGoBack)
+        harness.select("back_parent/child/demo.mp4")
+
+        lateinit var fakePlayer: FakeMedia3Player
+        quickLookMediaPlayerFactory = { _, _ ->
+            FakeMedia3Player(durationMs = 60_000L, videoSize = VideoSize(1280, 720)).also { fakePlayer = it }
+        }
+
+        rule.setContent {
+            WayfinderTheme(false) { AppRoot(harness.vm) }
+        }
+        idle(harness)
+
+        // Open Quick Look and press Android system Back (OnBackPressedDispatcher)
+        harness.vm.toggleQuickLook()
+        idle(harness)
+        assertNotNull(harness.s.quickLook)
+
+        rule.runOnUiThread {
+            rule.activity.onBackPressedDispatcher.onBackPressed()
+        }
+        idle(harness)
+        assertNull("System Back must dismiss QuickLook", harness.s.quickLook)
+        assertTrue("Dismissing QuickLook via Back must release player", fakePlayer.released)
+        assertEquals("System Back must not navigate underlying tab back while QuickLook was open", childDir.path, harness.s.active.path)
+
+        // Re-open Quick Look and send Key.Back
+        harness.vm.toggleQuickLook()
+        idle(harness)
+        assertNotNull(harness.s.quickLook)
+        rule.onNode(isFocused()).performKeyInput { pressKey(Key.Back) }
+        idle(harness)
+        assertNull("Key.Back must dismiss QuickLook", harness.s.quickLook)
+        assertEquals(childDir.path, harness.s.active.path)
+    }
+
+    @Test
+    fun backgroundLifecyclePreventsAutoplayOnMountAndStopsOnStop() {
+        val harness = VmHarness().also { h = it }
+        harness.file("bg/song.mp3", "audio")
+        harness.navigate(harness.pathOf("bg"))
+        harness.select("bg/song.mp3")
+
+        lateinit var fakePlayer: FakeMedia3Player
+        quickLookMediaPlayerFactory = { _, _ ->
+            FakeMedia3Player(durationMs = 120_000L).also { fakePlayer = it }
+        }
+
+        // Simulate user minimizing/locking screen BEFORE QuickLook audio mounts
+        rule.activityRule.scenario.moveToState(Lifecycle.State.STARTED)
+        try {
+            harness.vm.toggleQuickLook()
+            harness.settle()
+            rule.setContent {
+                val s by harness.vm.state.collectAsState()
+                WayfinderTheme(false) { QuickLook(harness.vm, s) }
+            }
+            idle(harness)
+            assertFalse("Audio must NOT autoplay when mounted below RESUMED state", fakePlayer.fakePlayWhenReady)
+
+            // Resume activity, explicitly start playback, then move to CREATED (ON_PAUSE + ON_STOP)
+            rule.activityRule.scenario.moveToState(Lifecycle.State.RESUMED)
+            idle(harness)
+            rule.onNodeWithContentDescription("Play").performClick()
+            idle(harness)
+            assertTrue(fakePlayer.fakePlayWhenReady)
+
+            rule.activityRule.scenario.moveToState(Lifecycle.State.CREATED)
+            idle(harness)
+            assertFalse("Moving to CREATED/STOPPED must pause playback", fakePlayer.fakePlayWhenReady)
+        } finally {
+            rule.activityRule.scenario.moveToState(Lifecycle.State.RESUMED)
+        }
+    }
+
+    @Test
+    fun seekBarExposesTimestampStateDescriptionHandlesSpaceEnterAndSkipsCanvasTabStop() {
+        val harness = VmHarness().also { h = it }
+        harness.file("a11y/movie.mp4", "video")
+        harness.navigate(harness.pathOf("a11y"))
+        harness.select("a11y/movie.mp4")
+
+        lateinit var fakePlayer: FakeMedia3Player
+        quickLookMediaPlayerFactory = { _, _ ->
+            FakeMedia3Player(durationMs = 125_000L, videoSize = VideoSize(1920, 1080)).also {
+                fakePlayer = it
+            }
+        }
+
+        rule.setContent {
+            WayfinderTheme(false) { AppRoot(harness.vm) }
+        }
+        idle(harness)
+        harness.vm.toggleQuickLook()
+        idle(harness)
+
+        // Verify TalkBack timestamp stateDescription ("0:00 / 2:05" -> "0:46 / 2:05") on Playback position slider
+        val sliderNode = rule.onNodeWithContentDescription("Playback position")
+        sliderNode.assert(SemanticsMatcher.expectValue(SemanticsProperties.StateDescription, "0:00 / 2:05"))
+        rule.runOnUiThread { fakePlayer.seekTo(46_000L) }
+        idle(harness)
+        sliderNode.assert(SemanticsMatcher.expectValue(SemanticsProperties.StateDescription, "0:46 / 2:05"))
+
+        // Tab through Quick Look controls and verify the backdrop video canvas never becomes a Tab stop
+        repeat(10) {
+            rule.onNode(isFocused()).performKeyInput { pressKey(Key.Tab) }
+            idle(harness)
+            val cfg = rule.onNode(isFocused()).fetchSemanticsNode().config
+            val hasLabel = cfg.contains(SemanticsProperties.ContentDescription) || cfg.contains(SemanticsProperties.Text)
+            assertTrue("Every Tab stop inside QuickLook must be a labeled control, not an un-ringed backdrop", hasLabel)
+        }
+
+        // Focus slider and verify Spacebar pauses and Enter resumes (no dead keys)
+        sliderNode.requestFocus()
+        idle(harness)
+        assertTrue(fakePlayer.fakePlayWhenReady)
+        sliderNode.performKeyInput { pressKey(Key.Spacebar) }
+        idle(harness)
+        assertFalse("Spacebar on focused seekbar should pause playback", fakePlayer.fakePlayWhenReady)
+        sliderNode.performKeyInput { pressKey(Key.Enter) }
+        idle(harness)
+        assertTrue("Enter on focused seekbar should resume playback", fakePlayer.fakePlayWhenReady)
+    }
+
+    @Test
+    fun decompressionBombAnimatedHeadersAndOversizedGifsAreRejectedBeforeDecode() {
+        val harness = VmHarness().also { h = it }
+        val bombGifBytes = ByteBuffer.allocate(14).order(ByteOrder.LITTLE_ENDIAN).apply {
+            put("GIF89a".toByteArray(Charsets.US_ASCII))
+            putShort(32_768.toShort())
+            putShort(32_768.toShort())
+            put(0); put(0); put(0)
+            put(';'.code.toByte())
+        }.array()
+        val bombGif = File(harness.dir("bombs"), "bomb.gif").apply { writeBytes(bombGifBytes) }
+        harness.navigate(harness.pathOf("bombs"))
+        harness.select("bombs/bomb.gif")
+
+        var factoryCalled = false
+        quickLookAnimatedDrawableFactory = { _, _ ->
+            factoryCalled = true
+            FakeAnimatedDrawable()
+        }
+
+        harness.vm.toggleQuickLook()
+        harness.settle()
+
+        rule.setContent {
+            val s by harness.vm.state.collectAsState()
+            WayfinderTheme(false) { QuickLook(harness.vm, s) }
+        }
+        idle(harness)
+        rule.waitUntil(5_000) {
+            rule.onAllNodesWithText("Can't preview this image in Quick Look.").fetchSemanticsNodes().isNotEmpty()
+        }
+        assertFalse("Decompression bomb GIF must be rejected before invoking animated decoder", factoryCalled)
+        assertTrue(bombGif.exists())
     }
 }

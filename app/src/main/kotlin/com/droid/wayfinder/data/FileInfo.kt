@@ -117,6 +117,42 @@ object FileInfo {
         runCatching { java.nio.file.Files.isSymbolicLink(java.nio.file.Paths.get(path)) }.getOrDefault(false)
 
     /**
+     * True iff [path] exists and `lstat` confirms it is a regular file (`S_ISREG`), without following
+     * symbolic links or opening the file — rejecting symlinks, named FIFOs, sockets, devices, and folders.
+     */
+    fun isRegularFileNoFollow(path: String): Boolean {
+        if (path.isEmpty() || path.contains('\u0000')) return false
+        val osStat = runCatching { android.system.Os.lstat(path) }.getOrNull()
+        if (osStat != null && osStat.st_mode != 0) {
+            if (!android.system.OsConstants.S_ISREG(osStat.st_mode)) return false
+        }
+        return runCatching {
+            val attrs = Files.readAttributes(
+                java.nio.file.Paths.get(path),
+                BasicFileAttributes::class.java,
+                LinkOption.NOFOLLOW_LINKS,
+            )
+            attrs.isRegularFile && !attrs.isSymbolicLink && !attrs.isDirectory && !attrs.isOther
+        }.getOrDefault(false)
+    }
+
+    /** Returns the regular-file byte size via `lstat` / `NOFOLLOW_LINKS`, or `-1L` if non-regular or unreadable. */
+    fun regularFileSizeNoFollow(path: String): Long {
+        if (!isRegularFileNoFollow(path)) return -1L
+        val osStat = runCatching { android.system.Os.lstat(path) }.getOrNull()
+        if (osStat != null && osStat.st_mode != 0 && android.system.OsConstants.S_ISREG(osStat.st_mode)) {
+            return osStat.st_size
+        }
+        return runCatching {
+            Files.readAttributes(
+                java.nio.file.Paths.get(path),
+                BasicFileAttributes::class.java,
+                LinkOption.NOFOLLOW_LINKS,
+            ).size()
+        }.getOrDefault(-1L)
+    }
+
+    /**
      * Deletes [f] and everything below it **without following symbolic links** (a link is removed, never the
      * folder it points to), unlike Kotlin's `File.deleteRecursively` which descends into linked folders.
      * Returns true when [f] no longer exists.

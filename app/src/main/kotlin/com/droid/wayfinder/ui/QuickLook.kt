@@ -7,6 +7,7 @@ import android.graphics.Bitmap
 import android.graphics.pdf.PdfRenderer
 import android.net.Uri
 import android.os.ParcelFileDescriptor
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -97,6 +98,7 @@ private val TEXT_EXTS = setOf("csv", "tsv", "srt", "properties", "toml", "env", 
 /** macOS-style Quick Look overlay: Space opens/closes, arrows step through items, Enter opens. */
 @Composable
 fun QuickLook(vm: BrowserViewModel, s: AppState) {
+    BackHandler(enabled = s.quickLook != null) { vm.closeQuickLook() }
     val path = s.quickLook ?: return
     val entry = (s.active.searchResults ?: s.active.entries).firstOrNull { it.path == path }
     LaunchedEffect(entry == null) { if (entry == null) vm.closeQuickLook() }
@@ -243,6 +245,12 @@ private fun Header(vm: BrowserViewModel, e: FileEntry) {
     }
 }
 
+private enum class LocalPreviewSafety {
+    Checking,
+    Safe,
+    Blocked,
+}
+
 @Composable
 private fun Body(vm: BrowserViewModel, e: FileEntry) {
     if (e.isDir && !e.isServer) { FolderPreview(vm, e); return }
@@ -257,16 +265,31 @@ private fun Body(vm: BrowserViewModel, e: FileEntry) {
         Placeholder(e, if (FsPath.isZip(e.path)) "Preview isn't available inside archives. Press Enter to open." else "Preview isn't available for network and cloud files yet. Press Enter to open.")
         return
     }
-    val ext = e.extension.lowercase()
-    val localUri = remember(e.path) { Uri.fromFile(File(e.path)) }
-    when {
-        e.kind == FileKind.Image -> ImagePreview(e, localUri)
-        e.kind == FileKind.Video -> VideoPlayerPreview(vm, e, localUri)
-        e.kind == FileKind.Pdf -> PdfPreview(e)
-        e.kind == FileKind.Audio -> AudioPlayerPreview(vm, e, localUri)
-        e.kind == FileKind.Text || e.kind == FileKind.Code || ext in TEXT_EXTS -> TextPreview(e)
-        ext == "zip" || ext == "tar" || ext == "tgz" || e.name.endsWith(".tar.gz", true) -> ZipPreview(e)
-        else -> BinaryPreview(e)
+    if (e.isLink || (e.mode != 0 && FileInfo.typeChar(e.mode) != '-')) {
+        Placeholder(e, stringResource(R.string.quicklook_unsafe_local_file))
+        return
+    }
+    val safety by produceState(LocalPreviewSafety.Checking, e.path, e.modified, e.isLink, e.mode) {
+        value = withContext(Dispatchers.IO) {
+            if (vm.isSafeLocalRegularFile(e)) LocalPreviewSafety.Safe else LocalPreviewSafety.Blocked
+        }
+    }
+    when (safety) {
+        LocalPreviewSafety.Checking -> CircularProgressIndicator()
+        LocalPreviewSafety.Blocked -> Placeholder(e, stringResource(R.string.quicklook_unsafe_local_file))
+        LocalPreviewSafety.Safe -> {
+            val ext = e.extension.lowercase()
+            val localUri = remember(e.path) { Uri.fromFile(File(e.path)) }
+            when {
+                e.kind == FileKind.Image -> ImagePreview(vm, e, localUri)
+                e.kind == FileKind.Video -> VideoPlayerPreview(vm, e, localUri)
+                e.kind == FileKind.Pdf -> PdfPreview(e)
+                e.kind == FileKind.Audio -> AudioPlayerPreview(vm, e, localUri)
+                e.kind == FileKind.Text || e.kind == FileKind.Code || ext in TEXT_EXTS -> TextPreview(e)
+                ext == "zip" || ext == "tar" || ext == "tgz" || e.name.endsWith(".tar.gz", true) -> ZipPreview(e)
+                else -> BinaryPreview(e)
+            }
+        }
     }
 }
 
@@ -286,7 +309,7 @@ private fun LocalDocumentMediaPreview(vm: BrowserViewModel, e: FileEntry) {
             val uri = s.uri
             if (uri != null) {
                 when (e.kind) {
-                    FileKind.Image -> ImagePreview(e, uri)
+                    FileKind.Image -> ImagePreview(vm, e, uri)
                     FileKind.Video -> VideoPlayerPreview(vm, e, uri)
                     FileKind.Audio -> AudioPlayerPreview(vm, e, uri)
                     else -> Placeholder(e, "Preview isn't available for network and cloud files yet. Press Enter to open.")
@@ -429,7 +452,12 @@ private fun RemoteMediaPreview(vm: BrowserViewModel, e: FileEntry) {
         val cachedFile = rememberThumbnailFile(vm, e)
         if (cachedFile != null) {
             val cachedUri = remember(cachedFile) { Uri.fromFile(cachedFile) }
-            AnimatedImagePreview(e = e, uri = cachedUri, fallbackModel = cachedFile)
+            AnimatedImagePreview(
+                e = e,
+                uri = cachedUri,
+                fallbackModel = cachedFile,
+                onOpenExternal = { vm.closeQuickLook(); vm.openSelection() },
+            )
             return
         }
     }
@@ -458,10 +486,15 @@ private fun RemoteMediaPreview(vm: BrowserViewModel, e: FileEntry) {
 }
 
 @Composable
-private fun ImagePreview(e: FileEntry, uri: Uri) {
+private fun ImagePreview(vm: BrowserViewModel, e: FileEntry, uri: Uri) {
     if (MediaPreviewSupport.isAnimatedImageExtension(e.extension)) {
         val fallback: Any = if (FsPath.isLocalFile(e.path)) File(e.path) else uri
-        AnimatedImagePreview(e = e, uri = uri, fallbackModel = fallback)
+        AnimatedImagePreview(
+            e = e,
+            uri = uri,
+            fallbackModel = fallback,
+            onOpenExternal = { vm.closeQuickLook(); vm.openSelection() },
+        )
         return
     }
     val ctx = LocalContext.current

@@ -147,7 +147,7 @@ fun PreviewPane(vm: BrowserViewModel, s: AppState, modifier: Modifier) {
                         }
                         if (!e.isServer && !e.isShare && !FsPath.isZip(e.path) && !inTrash) FilledTonalButton({ vm.requestRename() }, modifier = btnMod, contentPadding = btnPadding) { Text("Rename", maxLines = 1, softWrap = false) }
                     }
-                    if (!e.isDir && FsPath.isLocalFile(e.path) && (e.kind == FileKind.Text || e.kind == FileKind.Code)) TextSnippet(e)
+                    if (!e.isDir && !e.isLink && FsPath.isLocalFile(e.path) && (e.kind == FileKind.Text || e.kind == FileKind.Code)) TextSnippet(vm, e)
                 }
                 else -> {
                     Preview(null, icuStringResource(R.string.selected_count_plural, sel.size), "Multiple")
@@ -174,9 +174,17 @@ private fun Preview(
     val ctx = LocalContext.current
     val canQuickLook = entry != null && vm != null && !entry.isServer && !entry.isShare
     val quickLookLabel = stringResource(R.string.action_quick_look)
-    val audioArt by produceState<ImageBitmap?>(null, entry?.path, entry?.modified) {
-        value = if (entry != null && !entry.isDir && entry.kind == FileKind.Audio && FsPath.isLocalFile(entry.path)) {
+    val audioArt by produceState<ImageBitmap?>(null, entry?.path, entry?.modified, entry?.isLink, entry?.mode) {
+        value = if (
+            entry != null &&
+            vm != null &&
+            !entry.isDir &&
+            !entry.isLink &&
+            entry.kind == FileKind.Audio &&
+            FsPath.isLocalFile(entry.path)
+        ) {
             withContext(Dispatchers.IO) {
+                if (!vm.isSafeLocalRegularFile(entry)) return@withContext null
                 val meta = MediaPreviewLoader.extractFallbackAudioMetadata(ctx, Uri.fromFile(File(entry.path)))
                 MediaPreviewLoader.decodeArtworkBitmap(meta.artworkBytes, maxEdgePx = 480)?.asImageBitmap()
             }
@@ -326,10 +334,11 @@ private fun MarksEditor(vm: BrowserViewModel, s: AppState, e: FileEntry) {
 
 /** First lines of a text/code file. */
 @Composable
-private fun TextSnippet(e: FileEntry) {
+private fun TextSnippet(vm: BrowserViewModel, e: FileEntry) {
     val cs = MaterialTheme.colorScheme
-    val text by produceState<String?>(null, e.path, e.modified) {
+    val text by produceState<String?>(null, e.path, e.modified, e.isLink, e.mode) {
         value = withContext(Dispatchers.IO) {
+            if (!vm.isSafeLocalRegularFile(e)) return@withContext null
             runCatching {
                 File(e.path).inputStream().use { inp ->
                     val buf = ByteArray(1200)

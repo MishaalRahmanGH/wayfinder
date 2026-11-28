@@ -13,8 +13,11 @@ import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TemporaryFolder
 import java.io.ByteArrayOutputStream
+import java.io.File
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.nio.file.Files
+import java.util.concurrent.TimeUnit
 import kotlin.random.Random
 
 class MediaPreviewTest {
@@ -60,9 +63,34 @@ class MediaPreviewTest {
         return out.toByteArray()
     }
 
+    private fun buildGifHeader(width: Int, height: Int, version: String = "GIF89a"): ByteArray =
+        ByteBuffer.allocate(13).order(ByteOrder.LITTLE_ENDIAN).apply {
+            put(version.toByteArray(Charsets.US_ASCII))
+            putShort(width.toShort())
+            putShort(height.toShort())
+            put(0)
+            put(0)
+            put(0)
+        }.array()
+
+    private fun buildVp8xPayload(animated: Boolean, width: Int, height: Int): ByteArray {
+        val wMinus1 = (width - 1).coerceAtLeast(0)
+        val hMinus1 = (height - 1).coerceAtLeast(0)
+        return byteArrayOf(
+            if (animated) 0x02 else 0x00,
+            0, 0, 0,
+            (wMinus1 and 0xFF).toByte(),
+            ((wMinus1 shr 8) and 0xFF).toByte(),
+            ((wMinus1 shr 16) and 0xFF).toByte(),
+            (hMinus1 and 0xFF).toByte(),
+            ((hMinus1 shr 8) and 0xFF).toByte(),
+            ((hMinus1 shr 16) and 0xFF).toByte(),
+        )
+    }
+
     @Test
     fun animatedWebpHeaderDetectsVp8xFlagAndAnimChunkSafely() {
-        val animatedVp8x = buildWebp("VP8X" to byteArrayOf(0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0))
+        val animatedVp8x = buildWebp("VP8X" to buildVp8xPayload(animated = true, width = 640, height = 480))
         assertTrue(MediaPreviewSupport.isAnimatedWebpHeader(animatedVp8x))
         assertTrue(MediaPreviewSupport.isAnimatedImageHeader(animatedVp8x))
 
@@ -82,6 +110,53 @@ class MediaPreviewTest {
     }
 
     @Test
+    fun animatedCanvasAndFileSizeBoundsBlockDecompressionBombs() {
+        // Safe dimensions within 8192 max edge and 16,777,216 max pixels
+        assertTrue(MediaPreviewSupport.isValidAnimatedCanvasSize(640, 480))
+        assertTrue(MediaPreviewSupport.isValidAnimatedCanvasSize(4096, 4096))
+        assertTrue(MediaPreviewSupport.isValidAnimatedCanvasSize(8192, 2048))
+        assertTrue(MediaPreviewSupport.isValidAnimatedCanvasSize(2048, 8192))
+
+        // Decompression bombs and invalid dimensions rejected
+        assertFalse(MediaPreviewSupport.isValidAnimatedCanvasSize(8193, 100))
+        assertFalse(MediaPreviewSupport.isValidAnimatedCanvasSize(100, 8193))
+        assertFalse(MediaPreviewSupport.isValidAnimatedCanvasSize(4097, 4096)) // > 16,777,216 pixels
+        assertFalse(MediaPreviewSupport.isValidAnimatedCanvasSize(16_383, 16_383)) // Animated WebP 3.2 GB bomb
+        assertFalse(MediaPreviewSupport.isValidAnimatedCanvasSize(32_768, 32_768)) // GIF89a 4 GB LSD bomb
+        assertFalse(MediaPreviewSupport.isValidAnimatedCanvasSize(65_535, 65_535)) // GIF89a max 17 GB LSD bomb
+        assertFalse(MediaPreviewSupport.isValidAnimatedCanvasSize(Int.MAX_VALUE, Int.MAX_VALUE))
+        assertFalse(MediaPreviewSupport.isValidAnimatedCanvasSize(0, 512))
+        assertFalse(MediaPreviewSupport.isValidAnimatedCanvasSize(512, -1))
+
+        // File size bounds (<= 64 MB)
+        assertTrue(MediaPreviewSupport.isAcceptableAnimatedFileSize(1L))
+        assertTrue(MediaPreviewSupport.isAcceptableAnimatedFileSize(MediaPreviewSupport.MAX_ANIMATED_FILE_BYTES))
+        assertFalse(MediaPreviewSupport.isAcceptableAnimatedFileSize(0L))
+        assertFalse(MediaPreviewSupport.isAcceptableAnimatedFileSize(-1L))
+        assertFalse(MediaPreviewSupport.isAcceptableAnimatedFileSize(MediaPreviewSupport.MAX_ANIMATED_FILE_BYTES + 1L))
+        assertFalse(MediaPreviewSupport.isAcceptableAnimatedFileSize(Long.MAX_VALUE))
+
+        // Artwork source dimension cap blocks 20,000 x 20,000 solid-PNG bombs
+        assertTrue(MediaPreviewSupport.isValidArtworkSourceSize(1024, 1024))
+        assertTrue(MediaPreviewSupport.isValidArtworkSourceSize(16_384, 600))
+        assertFalse(MediaPreviewSupport.isValidArtworkSourceSize(20_000, 20_000))
+        assertFalse(MediaPreviewSupport.isValidArtworkSourceSize(16_385, 64))
+        assertFalse(MediaPreviewSupport.isValidArtworkSourceSize(9_000, 9_000))
+
+        // Header dimension parser accurately extracts GIF LSD and WebP VP8X dimensions
+        assertEquals(640 to 480, MediaPreviewSupport.parseAnimatedHeaderDimensions(buildGifHeader(640, 480)))
+        val gifBomb = buildGifHeader(32_768, 32_768)
+        assertEquals(32_768 to 32_768, MediaPreviewSupport.parseAnimatedHeaderDimensions(gifBomb))
+        val (gifW, gifH) = MediaPreviewSupport.parseAnimatedHeaderDimensions(gifBomb)!!
+        assertFalse(MediaPreviewSupport.isValidAnimatedCanvasSize(gifW, gifH))
+
+        val webpBomb = buildWebp("VP8X" to buildVp8xPayload(animated = true, width = 16_383, height = 16_383))
+        assertEquals(16_383 to 16_383, MediaPreviewSupport.parseAnimatedHeaderDimensions(webpBomb))
+        val (webpW, webpH) = MediaPreviewSupport.parseAnimatedHeaderDimensions(webpBomb)!!
+        assertFalse(MediaPreviewSupport.isValidAnimatedCanvasSize(webpW, webpH))
+    }
+
+    @Test
     fun animatedHeaderParsersResistFuzzedAndAdversarialInputs() {
         val rng = Random(42)
         // Adversarial RIFF/WEBP headers with max uint32 chunk sizes (0xFFFFFFFF) and zero-length loops.
@@ -95,6 +170,7 @@ class MediaPreviewTest {
             this[19] = 0xFF.toByte()
         }
         assertFalse(MediaPreviewSupport.isAnimatedWebpHeader(overflowChunk))
+        assertNull(MediaPreviewSupport.parseAnimatedHeaderDimensions(overflowChunk))
 
         val zeroLoopChunks = ByteArray(12 + 40 * 8).apply {
             "RIFF".toByteArray().copyInto(this, 0)
@@ -104,21 +180,27 @@ class MediaPreviewTest {
             }
         }
         assertFalse(MediaPreviewSupport.isAnimatedWebpHeader(zeroLoopChunks))
+        assertNull(MediaPreviewSupport.parseAnimatedHeaderDimensions(zeroLoopChunks))
 
-        repeat(500) {
+        repeat(600) {
             val len = rng.nextInt(0, 128)
             val data = ByteArray(len)
             rng.nextBytes(data)
             if (len >= 12 && it % 3 == 0) {
                 "RIFF".toByteArray().copyInto(data, 0)
                 "WEBP".toByteArray().copyInto(data, 8)
+            } else if (len >= 6 && it % 5 == 0) {
+                "GIF89a".toByteArray().copyInto(data, 0)
             }
             MediaPreviewSupport.isAnimatedImageHeader(data)
+            MediaPreviewSupport.parseAnimatedHeaderDimensions(data)?.let { (w, h) ->
+                MediaPreviewSupport.isValidAnimatedCanvasSize(w, h)
+            }
         }
     }
 
     @Test
-    fun dimensionScalingAndSampleSizeAvoidUpscalingAndZeroDivision() {
+    fun dimensionScalingAndSampleSizeAvoidUpscalingAndDownsamplePanoramicImages() {
         assertEquals(800 to 600, MediaPreviewSupport.computeScaledDimensions(800, 600, 2048))
         assertEquals(2048 to 1024, MediaPreviewSupport.computeScaledDimensions(4096, 2048, 2048))
         assertEquals(1024 to 2048, MediaPreviewSupport.computeScaledDimensions(2048, 4096, 2048))
@@ -128,10 +210,14 @@ class MediaPreviewTest {
         assertEquals(400 to 300, MediaPreviewSupport.computeScaledDimensions(400, 300, 0))
 
         assertEquals(1, MediaPreviewSupport.computeInSampleSize(500, 500, 720))
-        assertEquals(1, MediaPreviewSupport.computeInSampleSize(1000, 1000, 720))
+        assertEquals(1, MediaPreviewSupport.computeInSampleSize(720, 720, 720))
+        assertEquals(2, MediaPreviewSupport.computeInSampleSize(1000, 1000, 720))
         assertEquals(2, MediaPreviewSupport.computeInSampleSize(1440, 1440, 720))
         assertEquals(4, MediaPreviewSupport.computeInSampleSize(2880, 2880, 720))
         assertEquals(8, MediaPreviewSupport.computeInSampleSize(5760, 5760, 720))
+        // Panoramic cover art (32,000 x 600 = 77 MB raw) must be downsampled on its wide axis!
+        assertEquals(64, MediaPreviewSupport.computeInSampleSize(32_000, 600, 720))
+        assertEquals(64, MediaPreviewSupport.computeInSampleSize(600, 32_000, 720))
         assertEquals(1, MediaPreviewSupport.computeInSampleSize(0, 0, 720))
     }
 
@@ -207,12 +293,37 @@ class MediaPreviewTest {
     }
 
     @Test
-    fun loaderReadsFileHeadersAndRejectsEmptyOrOversizedArtworkSafely() {
-        val gifFile = tmp.newFile("anim.gif").apply {
-            writeBytes("GIF89a\u0001\u0000\u0001\u0000\u0000\u0000\u0000;".toByteArray(Charsets.ISO_8859_1))
+    fun regularFileChecksRejectSymlinksFifosDirectoriesAndMissingPaths() {
+        val regular = tmp.newFile("anim.gif").apply {
+            writeBytes(buildGifHeader(32, 32))
         }
-        val prefix = MediaPreviewLoader.readHeaderPrefix(gifFile)
-        assertTrue(MediaPreviewSupport.isGifHeader(prefix))
+        assertTrue(FileInfo.isRegularFileNoFollow(regular.path))
+        assertEquals(regular.length(), FileInfo.regularFileSizeNoFollow(regular.path))
+        assertTrue(MediaPreviewSupport.isGifHeader(MediaPreviewLoader.readHeaderPrefix(regular)))
+
+        val subDir = tmp.newFolder("sub")
+        assertFalse(FileInfo.isRegularFileNoFollow(subDir.path))
+        assertFalse(FileInfo.isRegularFileNoFollow(File(subDir, "missing.gif").path))
+
+        val sym = File(subDir, "sym.gif")
+        val symCreated = runCatching { Files.createSymbolicLink(sym.toPath(), regular.toPath()); true }.getOrDefault(false)
+        if (symCreated) {
+            assertFalse("Symlink must be rejected by isRegularFileNoFollow", FileInfo.isRegularFileNoFollow(sym.path))
+            assertEquals(-1L, FileInfo.regularFileSizeNoFollow(sym.path))
+            assertEquals(0, MediaPreviewLoader.readHeaderPrefix(sym).size)
+        }
+
+        val fifo = File(subDir, "pipe.mp3")
+        val fifoCreated = runCatching {
+            val proc = ProcessBuilder("mkfifo", fifo.path).start()
+            proc.waitFor(2, TimeUnit.SECONDS) && proc.exitValue() == 0 && fifo.exists()
+        }.getOrDefault(false)
+        if (fifoCreated) {
+            assertFalse("Named FIFO must be rejected without opening", FileInfo.isRegularFileNoFollow(fifo.path))
+            assertEquals(-1L, FileInfo.regularFileSizeNoFollow(fifo.path))
+            // Must return immediately without blocking on open(O_RDONLY)
+            assertEquals(0, MediaPreviewLoader.readHeaderPrefix(fifo).size)
+        }
 
         // Null / empty bytes return null safely
         assertNull(MediaPreviewLoader.decodeArtworkBitmap(null))

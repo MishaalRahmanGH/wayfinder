@@ -1319,62 +1319,68 @@ class BrowserViewModel(private val app: Application, handle: SavedStateHandle) :
 
     /** True if [e] can get an image/video thumbnail (local files, and network/cloud files such as SMB, NAS, WebDAV, FTP, SAF). */
     fun canThumbnail(e: FileEntry): Boolean {
-        if (e.isDir || e.isServer || e.isShare) return false
+        if (e.isDir || e.isLink || e.isServer || e.isShare) return false
         if (e.kind != FileKind.Image && e.kind != FileKind.Video) return false
-        if (FsPath.isLocalFile(e.path)) return true
+        if (FsPath.isLocalFile(e.path)) {
+            return e.mode == 0 || FileInfo.typeChar(e.mode) == '-'
+        }
         if (!FsPath.isRemote(e.path) || FsPath.isZip(e.path) || FsPath.isPhone(e.path)) return false
         return e.kind == FileKind.Video || e.size <= REMOTE_THUMB_MAX_IMAGE_BYTES
     }
 
     /**
-     * Local file to decode a thumbnail/preview from. Local files are used as-is; network and cloud files
-     * (SMB/NAS, WebDAV, FTP, SAF/Drive) are fetched once into `cacheDir/thumbs` keyed by path, size and
-     * modification time. Large videos only fetch their first [REMOTE_THUMB_VIDEO_PREFIX_BYTES], which is
-     * enough for a frame from most streamable files. Returns null when no thumbnail can be produced.
+     * Local file to decode a thumbnail/preview from. Local files are used after verifying regular-file
+     * and non-private path safety; network and cloud files (SMB/NAS, WebDAV, FTP, SAF/Drive) are fetched
+     * once into `cacheDir/thumbs` keyed by path, size and modification time. Large videos only fetch
+     * their first [REMOTE_THUMB_VIDEO_PREFIX_BYTES], which is enough for a frame from most streamable files.
+     * Returns null when no thumbnail can be produced.
      */
     suspend fun thumbnailSource(e: FileEntry): File? {
         if (!canThumbnail(e)) return null
-        if (FsPath.isLocalFile(e.path)) return File(e.path)
-        val ext = e.extension.lowercase().filter { it.isLetterOrDigit() }.take(8).ifEmpty { "bin" }
-        val dir = File(app.cacheDir, THUMBS_DIR)
-        val target = File(dir, "${cacheKeyFor("${e.path}|${e.size}|${e.modified}")}.$ext")
-        if (target.length() > 0) return target
-        val lock = thumbLocks.getOrPut(target.name) { kotlinx.coroutines.sync.Mutex() }
-        return lock.withLock {
+        return withContext(Dispatchers.IO) {
+            if (FsPath.isLocalFile(e.path)) {
+                return@withContext File(e.path).takeIf { isSafeLocalRegularFile(e) }
+            }
+            val ext = e.extension.lowercase().filter { it.isLetterOrDigit() }.take(8).ifEmpty { "bin" }
+            val dir = File(app.cacheDir, THUMBS_DIR)
+            val target = File(dir, "${cacheKeyFor("${e.path}|${e.size}|${e.modified}")}.$ext")
+            if (target.length() > 0) return@withContext target
+            val lock = thumbLocks.getOrPut(target.name) { kotlinx.coroutines.sync.Mutex() }
+            lock.withLock {
                 if (target.length() > 0) return@withLock target
                 thumbSlots.withPermit {
-                    withContext(Dispatchers.IO) {
-                        runCatching {
-                            dir.mkdirs()
-                            val limit = if (e.kind == FileKind.Video) REMOTE_THUMB_VIDEO_PREFIX_BYTES else REMOTE_THUMB_MAX_IMAGE_BYTES
-                            val tmp = File(dir, "${target.name}.part")
-                            try {
-                                val fetchedGraphThumb = FsPath.isOneDrive(e.path) &&
-                                    e.kind == FileKind.Image &&
-                                    onedrive.downloadThumbnailToFile(e.path, tmp)
-                                if (!fetchedGraphThumb) {
-                                    repo.fs(e.path).openInput(e.path).use { inp ->
-                                        tmp.outputStream().use { out ->
-                                            val buf = ByteArray(64 * 1024)
-                                            var total = 0L
-                                            while (total < limit) {
-                                                currentCoroutineContext().ensureActive()
-                                                val n = inp.read(buf, 0, minOf(buf.size.toLong(), limit - total).toInt())
-                                                if (n < 0) break
-                                                out.write(buf, 0, n)
-                                                total += n
-                                            }
+                    runCatching {
+                        dir.mkdirs()
+                        val limit = if (e.kind == FileKind.Video) REMOTE_THUMB_VIDEO_PREFIX_BYTES else REMOTE_THUMB_MAX_IMAGE_BYTES
+                        val tmp = File(dir, "${target.name}.part")
+                        try {
+                            val fetchedGraphThumb = FsPath.isOneDrive(e.path) &&
+                                e.kind == FileKind.Image &&
+                                !com.droid.wayfinder.data.MediaPreviewSupport.isAnimatedImageExtension(e.extension) &&
+                                onedrive.downloadThumbnailToFile(e.path, tmp)
+                            if (!fetchedGraphThumb) {
+                                repo.fs(e.path).openInput(e.path).use { inp ->
+                                    tmp.outputStream().use { out ->
+                                        val buf = ByteArray(64 * 1024)
+                                        var total = 0L
+                                        while (total < limit) {
+                                            currentCoroutineContext().ensureActive()
+                                            val n = inp.read(buf, 0, minOf(buf.size.toLong(), limit - total).toInt())
+                                            if (n < 0) break
+                                            out.write(buf, 0, n)
+                                            total += n
                                         }
                                     }
                                 }
-                                if (tmp.length() > 0 && tmp.renameTo(target)) target else null
-                            } finally {
-                                tmp.delete()
                             }
-                        }.getOrNull()
-                    }
+                            if (tmp.length() > 0 && tmp.renameTo(target)) target else null
+                        } finally {
+                            tmp.delete()
+                        }
+                    }.getOrNull()
                 }
             }
+        }
     }
 
     // ---------------------------------------------------------------- selection & focus
@@ -1458,7 +1464,7 @@ class BrowserViewModel(private val app: Application, handle: SavedStateHandle) :
      */
     suspend fun resolvePreviewUri(entry: FileEntry): Uri? = withContext(Dispatchers.IO) {
         when {
-            FsPath.isLocalFile(entry.path) -> Uri.fromFile(File(entry.path))
+            FsPath.isLocalFile(entry.path) -> if (isSafeLocalRegularFile(entry)) Uri.fromFile(File(entry.path)) else null
             FsPath.isSaf(entry.path) -> saf.documentUriOf(entry.path)
                 ?.takeIf { com.droid.wayfinder.data.MediaInspector.isLocalSeekableContentUri(it) }
             FsPath.isDoc(entry.path) -> com.droid.wayfinder.data.SystemDocumentsBridge.toDocumentsContractUri(entry.path, tree = false)
@@ -3285,8 +3291,19 @@ class BrowserViewModel(private val app: Application, handle: SavedStateHandle) :
         return configuredRoots.any { root -> FsPath.isWithin(root, target) }
     }
 
+    /**
+     * Verifies off-main-thread that [entry] is a safe, non-symlink regular local file (`S_ISREG`)
+     * outside Wayfinder's private app storage — rejecting symlinks, named FIFOs, and internal app data.
+     */
+    internal fun isSafeLocalRegularFile(entry: FileEntry): Boolean {
+        if (entry.isDir || entry.isLink || !FsPath.isLocalFile(entry.path)) return false
+        if (entry.mode != 0 && FileInfo.typeChar(entry.mode) != '-') return false
+        if (!FileInfo.isRegularFileNoFollow(entry.path)) return false
+        return !isUnsafeToExpose(entry.path)
+    }
+
     /** True for symbolic links or files resolving inside the app's private storage, which must never leave the app. */
-    private fun isUnsafeToExpose(path: String): Boolean {
+    internal fun isUnsafeToExpose(path: String): Boolean {
         if (FileInfo.isSymlink(path)) return true
         return isPrivatePath(path)
     }
@@ -3295,7 +3312,11 @@ class BrowserViewModel(private val app: Application, handle: SavedStateHandle) :
     private fun isPrivatePath(path: String): Boolean {
         val canonical = runCatching { File(path).canonicalPath }.getOrDefault(path)
         val data = runCatching { File(app.applicationInfo.dataDir).canonicalPath }.getOrDefault(app.applicationInfo.dataDir)
-        return FsPath.isWithin(data, canonical) || FsPath.isWithin(app.applicationInfo.dataDir, path)
+        val deRaw = app.applicationInfo.deviceProtectedDataDir
+        val deCanonical = deRaw?.let { runCatching { File(it).canonicalPath }.getOrDefault(it) }
+        return FsPath.isWithin(data, canonical) ||
+            FsPath.isWithin(app.applicationInfo.dataDir, path) ||
+            (deRaw != null && deCanonical != null && (FsPath.isWithin(deCanonical, canonical) || FsPath.isWithin(deRaw, path)))
     }
 }
 

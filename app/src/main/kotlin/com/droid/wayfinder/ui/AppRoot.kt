@@ -485,10 +485,14 @@ fun AppRoot(vm: BrowserViewModel) {
                 }
                 return true
             }
+            val mediaActions = focusCoord.activeQuickLookMediaActions
             if (quickLookZoneFocused && !ctrl && !alt && (k == Key.Enter || k == Key.NumPadEnter || k == Key.Spacebar)) {
+                if (mediaActions?.isSliderFocused?.invoke() == true) {
+                    mediaActions.togglePlayPause()
+                    return true
+                }
                 return false
             }
-            val mediaActions = focusCoord.activeQuickLookMediaActions
             if (!ctrl && !alt && mediaActions != null) {
                 when {
                     k == Key.K || k == Key.P || k == Key.MediaPlayPause -> {
@@ -529,7 +533,7 @@ fun AppRoot(vm: BrowserViewModel) {
             }
             val cols = if (tab.viewMode == ViewMode.Grid) st.gridColumns else 1
             when (k) {
-                Key.Spacebar, Key.Escape -> vm.closeQuickLook()
+                Key.Spacebar, Key.Escape, Key.Back -> vm.closeQuickLook()
                 Key.Enter, Key.NumPadEnter -> { vm.closeQuickLook(); vm.openSelection() }
                 Key.DirectionLeft -> vm.quickLookMove(-1)
                 Key.DirectionRight -> vm.quickLookMove(1)

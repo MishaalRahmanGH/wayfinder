@@ -66,8 +66,8 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusProperties
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Brush
@@ -79,6 +79,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -86,6 +87,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LifecycleEventEffect
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.media3.common.AudioAttributes
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
@@ -94,20 +96,32 @@ import androidx.media3.common.PlaybackException
 import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player
 import androidx.media3.common.util.UnstableApi
+import androidx.media3.datasource.ContentDataSource
+import androidx.media3.datasource.DataSource
+import androidx.media3.datasource.DataSpec
+import androidx.media3.datasource.FileDataSource
+import androidx.media3.datasource.TransferListener
 import androidx.media3.exoplayer.ExoPlayer
-import androidx.media3.ui.compose.ContentFrame
+import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
+import androidx.media3.ui.compose.PlayerSurface
 import androidx.media3.ui.compose.SURFACE_TYPE_TEXTURE_VIEW
+import androidx.media3.ui.compose.modifiers.resizeWithContentScale
+import androidx.media3.ui.compose.state.rememberPresentationState
 import coil3.compose.AsyncImage
 import coil3.request.ImageRequest
 import com.droid.wayfinder.R
+import com.droid.wayfinder.data.AnimatedDrawableResult
 import com.droid.wayfinder.data.AudioTrackMetadata
 import com.droid.wayfinder.data.FileEntry
+import com.droid.wayfinder.data.FileInfo
 import com.droid.wayfinder.data.MediaPreviewLoader
 import com.droid.wayfinder.data.MediaPreviewSupport
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.io.IOException
+import java.util.Locale
 
 /** Optional test hook to inject a fake/stub Media3 [Player] in headless Compose UI tests. */
 internal var quickLookMediaPlayerFactory: ((context: Context, isVideo: Boolean) -> Player)? = null
@@ -118,6 +132,7 @@ internal var quickLookAnimatedDrawableFactory: ((context: Context, uri: Uri) -> 
 @Stable
 private class Media3PreviewController(
     val player: Player?,
+    private val isVideo: Boolean,
     initialFailed: Boolean,
 ) {
     var playbackState by mutableIntStateOf(player?.playbackState ?: Player.STATE_IDLE)
@@ -128,7 +143,9 @@ private class Media3PreviewController(
     var muted by mutableStateOf((player?.volume ?: 1f) <= 0f)
     var speed by mutableFloatStateOf(player?.playbackParameters?.speed ?: 1f)
     var failed by mutableStateOf(initialFailed)
-    var mediaMetadata by mutableStateOf(player?.mediaMetadata?.toAudioTrackMetadata() ?: AudioTrackMetadata())
+    var mediaMetadata by mutableStateOf(
+        if (!isVideo) player?.mediaMetadata?.toAudioTrackMetadata() ?: AudioTrackMetadata() else AudioTrackMetadata(),
+    )
 
     val isEnded: Boolean
         get() = playbackState == Player.STATE_ENDED
@@ -145,11 +162,13 @@ private class Media3PreviewController(
         durationMs = validDurationMs(p.duration)
         muted = p.volume <= 0f
         speed = p.playbackParameters.speed
-        val nextMeta = p.mediaMetadata.toAudioTrackMetadata()
-        if (nextMeta.hasAnyMetadata) {
-            val merged = MediaPreviewSupport.mergeAudioMetadata(nextMeta, mediaMetadata)
-            if (merged != mediaMetadata) {
-                mediaMetadata = merged
+        if (!isVideo) {
+            val nextMeta = p.mediaMetadata.toAudioTrackMetadata()
+            if (nextMeta.hasAnyMetadata) {
+                val merged = MediaPreviewSupport.mergeAudioMetadata(nextMeta, mediaMetadata)
+                if (merged != mediaMetadata) {
+                    mediaMetadata = merged
+                }
             }
         }
     }
@@ -215,9 +234,72 @@ private fun MediaMetadata.toAudioTrackMetadata(): AudioTrackMetadata = AudioTrac
     artworkBytes = artworkData?.takeIf { it.isNotEmpty() && it.size <= MediaPreviewSupport.MAX_ARTWORK_BYTES },
 )
 
+/**
+ * Local-only Media3 [DataSource.Factory] allowing solely regular `file://` files and `content://`
+ * provider streams — without `DefaultHttpDataSource` or any network/asset/raw scheme fallback.
+ */
 @OptIn(UnstableApi::class)
-private fun buildDefaultExoPlayer(context: Context, isVideo: Boolean): ExoPlayer =
-    ExoPlayer.Builder(context.applicationContext)
+internal fun createLocalOnlyDataSourceFactory(context: Context): DataSource.Factory {
+    val appContext = context.applicationContext
+    return DataSource.Factory { LocalOnlyDataSource(appContext) }
+}
+
+@OptIn(UnstableApi::class)
+private class LocalOnlyDataSource(private val appContext: Context) : DataSource {
+    private val transferListeners = mutableListOf<TransferListener>()
+    private var activeDelegate: DataSource? = null
+
+    override fun addTransferListener(transferListener: TransferListener) {
+        transferListeners += transferListener
+        activeDelegate?.addTransferListener(transferListener)
+    }
+
+    override fun open(dataSpec: DataSpec): Long {
+        check(activeDelegate == null) { "LocalOnlyDataSource is already open" }
+        val scheme = dataSpec.uri.scheme?.lowercase(Locale.ROOT)
+        val delegate: DataSource = when (scheme) {
+            "file" -> {
+                val path = dataSpec.uri.path ?: throw IOException("Missing local file path")
+                if (!FileInfo.isRegularFileNoFollow(path)) {
+                    throw IOException("Refusing to open non-regular local path")
+                }
+                FileDataSource()
+            }
+            "content" -> ContentDataSource(appContext)
+            else -> throw IOException("Disallowed Quick Look media URI scheme: $scheme")
+        }
+        transferListeners.forEach(delegate::addTransferListener)
+        activeDelegate = delegate
+        return try {
+            delegate.open(dataSpec)
+        } catch (t: Throwable) {
+            activeDelegate = null
+            throw t
+        }
+    }
+
+    override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+        val delegate = activeDelegate ?: throw IOException("DataSource is not open")
+        return delegate.read(buffer, offset, length)
+    }
+
+    override fun getUri(): Uri? = activeDelegate?.uri
+
+    override fun getResponseHeaders(): Map<String, List<String>> =
+        activeDelegate?.responseHeaders ?: emptyMap()
+
+    override fun close() {
+        val delegate = activeDelegate ?: return
+        activeDelegate = null
+        delegate.close()
+    }
+}
+
+@OptIn(UnstableApi::class)
+private fun buildDefaultExoPlayer(context: Context, isVideo: Boolean): ExoPlayer {
+    val appContext = context.applicationContext
+    return ExoPlayer.Builder(appContext)
+        .setMediaSourceFactory(DefaultMediaSourceFactory(createLocalOnlyDataSourceFactory(appContext)))
         .setAudioAttributes(
             AudioAttributes.Builder()
                 .setUsage(C.USAGE_MEDIA)
@@ -228,20 +310,27 @@ private fun buildDefaultExoPlayer(context: Context, isVideo: Boolean): ExoPlayer
         .setSeekBackIncrementMs(MediaPreviewSupport.SEEK_STEP_MS)
         .setSeekForwardIncrementMs(MediaPreviewSupport.SEEK_STEP_MS)
         .build()
+}
 
 @Composable
 private fun rememberMedia3PreviewController(uri: Uri, isVideo: Boolean): Media3PreviewController {
     val ctx = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
     val controller = remember(uri, isVideo) {
         val created = runCatching {
             quickLookMediaPlayerFactory?.invoke(ctx, isVideo) ?: buildDefaultExoPlayer(ctx, isVideo)
         }.getOrNull()
-        Media3PreviewController(player = created, initialFailed = created == null)
+        Media3PreviewController(player = created, isVideo = isVideo, initialFailed = created == null)
     }
 
-    LifecycleEventEffect(Lifecycle.Event.ON_PAUSE) {
-        runCatching { controller.player?.pause() }
+    val pauseOnBackground = {
+        runCatching {
+            controller.player?.pause()
+            controller.syncFromPlayer()
+        }
     }
+    LifecycleEventEffect(Lifecycle.Event.ON_PAUSE) { pauseOnBackground() }
+    LifecycleEventEffect(Lifecycle.Event.ON_STOP) { pauseOnBackground() }
 
     DisposableEffect(controller, uri) {
         val p = controller.player
@@ -270,11 +359,13 @@ private fun rememberMedia3PreviewController(uri: Uri, isVideo: Boolean): Media3P
             }
 
             override fun onMediaMetadataChanged(mediaMetadata: MediaMetadata) {
-                val parsed = mediaMetadata.toAudioTrackMetadata()
-                if (parsed.hasAnyMetadata) {
-                    val merged = MediaPreviewSupport.mergeAudioMetadata(parsed, controller.mediaMetadata)
-                    if (merged != controller.mediaMetadata) {
-                        controller.mediaMetadata = merged
+                if (!isVideo) {
+                    val parsed = mediaMetadata.toAudioTrackMetadata()
+                    if (parsed.hasAnyMetadata) {
+                        val merged = MediaPreviewSupport.mergeAudioMetadata(parsed, controller.mediaMetadata)
+                        if (merged != controller.mediaMetadata) {
+                            controller.mediaMetadata = merged
+                        }
                     }
                 }
             }
@@ -296,7 +387,7 @@ private fun rememberMedia3PreviewController(uri: Uri, isVideo: Boolean): Media3P
         p.addListener(listener)
         runCatching {
             p.setMediaItem(MediaItem.fromUri(uri))
-            p.playWhenReady = true
+            p.playWhenReady = lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)
             p.prepare()
             controller.syncFromPlayer()
         }.onFailure {
@@ -333,7 +424,12 @@ private fun RegisterQuickLookMediaActions(actions: QuickLookMediaActions?) {
     }
 }
 
-/** In-place Media3 ExoPlayer video preview using official [ContentFrame] (`SURFACE_TYPE_TEXTURE_VIEW`). */
+/**
+ * In-place Media3 ExoPlayer video preview composing [PlayerSurface] (`SURFACE_TYPE_TEXTURE_VIEW`)
+ * and [rememberPresentationState] directly with a solid black shutter — intentionally avoiding
+ * `ContentFrame`'s default `Artwork` slot so audio-only `.mp4`/`.mkv`/`.webm` containers with
+ * oversized embedded cover bitmaps can never trigger an unbounded `BitmapFactory.decodeByteArray`.
+ */
 @OptIn(UnstableApi::class)
 @Composable
 internal fun VideoPlayerPreview(vm: BrowserViewModel, e: FileEntry, uri: Uri) {
@@ -367,18 +463,24 @@ internal fun VideoPlayerPreview(vm: BrowserViewModel, e: FileEntry, uri: Uri) {
     }
 
     val noRipple = remember { MutableInteractionSource() }
+    val presentationState = rememberPresentationState(controller.player)
     Box(Modifier.fillMaxSize().background(Color.Black)) {
-        ContentFrame(
-            player = controller.player,
+        Box(
             modifier = Modifier
                 .fillMaxSize()
+                .focusProperties { canFocus = false }
                 .clickable(noRipple, indication = null) { controller.togglePlayPause() },
-            surfaceType = SURFACE_TYPE_TEXTURE_VIEW,
-            contentScale = ContentScale.Fit,
-            shutter = {
+            contentAlignment = Alignment.Center,
+        ) {
+            PlayerSurface(
+                player = controller.player,
+                surfaceType = SURFACE_TYPE_TEXTURE_VIEW,
+                modifier = Modifier.resizeWithContentScale(ContentScale.Fit, presentationState.videoSizeDp),
+            )
+            if (presentationState.coverSurface) {
                 Box(Modifier.fillMaxSize().background(Color.Black))
-            },
-        )
+            }
+        }
 
         if (controller.isBuffering) {
             CircularProgressIndicator(
@@ -440,7 +542,17 @@ internal fun AudioPlayerPreview(vm: BrowserViewModel, e: FileEntry, uri: Uri) {
     }
     RegisterQuickLookMediaActions(mediaActions)
 
-    val fallbackMeta by produceState(AudioTrackMetadata(), uri) {
+    val playerSettledForMeta = controller.failed ||
+        controller.player == null ||
+        controller.playbackState == Player.STATE_READY ||
+        controller.playbackState == Player.STATE_ENDED
+    val needsFallbackMeta = playerSettledForMeta && (
+        controller.mediaMetadata.artworkBytes == null ||
+            controller.mediaMetadata.title.isNullOrBlank() ||
+            controller.mediaMetadata.artist.isNullOrBlank()
+        )
+    val fallbackMeta by produceState(AudioTrackMetadata(), uri, needsFallbackMeta) {
+        if (!needsFallbackMeta) return@produceState
         value = withContext(Dispatchers.IO) { MediaPreviewLoader.extractFallbackAudioMetadata(ctx, uri) }
     }
     val mergedMeta = remember(controller.mediaMetadata, fallbackMeta) {
@@ -614,6 +726,9 @@ private fun MediaSeekBar(
     val displayedPositionMs = scrubFraction?.let { MediaPreviewSupport.fractionToPositionMs(it, durationMs) } ?: positionMs
     val seekable = durationMs > 0L
     val sliderLabel = stringResource(R.string.action_playback_position)
+    val formattedElapsed = MediaPreviewSupport.formatPlaybackTime(displayedPositionMs)
+    val formattedDuration = MediaPreviewSupport.formatPlaybackTime(durationMs)
+    val timestampStateDesc = "$formattedElapsed / $formattedDuration"
     val timeColor = if (darkOverlay) Color.White else cs.onSurfaceVariant
 
     Column(Modifier.fillMaxWidth()) {
@@ -630,7 +745,10 @@ private fun MediaSeekBar(
                 .fillMaxWidth()
                 .onFocusChanged { onSliderFocusChanged(it.isFocused) }
                 .focusRing(RoundedCornerShape(12.dp))
-                .semantics { contentDescription = sliderLabel },
+                .semantics {
+                    contentDescription = sliderLabel
+                    stateDescription = timestampStateDesc
+                },
             colors = if (darkOverlay) {
                 SliderDefaults.colors(
                     thumbColor = Color.White,
@@ -649,13 +767,13 @@ private fun MediaSeekBar(
             horizontalArrangement = Arrangement.SpaceBetween,
         ) {
             Text(
-                text = MediaPreviewSupport.formatPlaybackTime(displayedPositionMs),
+                text = formattedElapsed,
                 style = MaterialTheme.typography.labelMedium,
                 fontFamily = FontFamily.Monospace,
                 color = timeColor,
             )
             Text(
-                text = MediaPreviewSupport.formatPlaybackTime(durationMs),
+                text = formattedDuration,
                 style = MaterialTheme.typography.labelMedium,
                 fontFamily = FontFamily.Monospace,
                 color = if (darkOverlay) Color.White.copy(alpha = 0.8f) else cs.onSurfaceVariant,
@@ -792,22 +910,36 @@ private sealed interface AnimatedDecodeState {
     data object Loading : AnimatedDecodeState
     data class Animated(val drawable: Drawable) : AnimatedDecodeState
     data object StaticFallback : AnimatedDecodeState
+    data object RejectedUnsafeOrOversized : AnimatedDecodeState
 }
 
 /**
  * Animated GIF & animated WebP preview powered by Android's native [ImageDecoder] and
  * [android.graphics.drawable.AnimatedImageDrawable] (zero third-party libraries).
- * Falls back transparently to static Coil rendering for single-frame or unsupported files.
+ * Enforces file-size and unscaled canvas bounds *before* frame allocation, falling back safely
+ * without feeding decompression bombs to static image decoders.
  */
 @Composable
 internal fun AnimatedImagePreview(
     e: FileEntry,
     uri: Uri,
     fallbackModel: Any = uri,
+    onOpenExternal: (() -> Unit)? = null,
 ) {
     val ctx = LocalContext.current
-    val decodeState by produceState<AnimatedDecodeState>(AnimatedDecodeState.Loading, uri, e.modified) {
+    val decodeState by produceState<AnimatedDecodeState>(AnimatedDecodeState.Loading, uri, e.modified, e.size) {
         value = withContext(Dispatchers.IO) {
+            if (!MediaPreviewLoader.isWithinAnimatedSizeLimit(ctx, uri, e.size)) {
+                return@withContext AnimatedDecodeState.RejectedUnsafeOrOversized
+            }
+            val header = MediaPreviewLoader.readHeaderPrefix(ctx, uri)
+            if (!MediaPreviewSupport.isAnimatedImageHeader(header)) {
+                return@withContext AnimatedDecodeState.StaticFallback
+            }
+            val headerDims = MediaPreviewSupport.parseAnimatedHeaderDimensions(header)
+            if (headerDims != null && !MediaPreviewSupport.isValidAnimatedCanvasSize(headerDims.first, headerDims.second)) {
+                return@withContext AnimatedDecodeState.RejectedUnsafeOrOversized
+            }
             val injected = quickLookAnimatedDrawableFactory?.invoke(ctx, uri)
             if (injected != null) {
                 return@withContext if (injected is Animatable) {
@@ -816,28 +948,53 @@ internal fun AnimatedImagePreview(
                     AnimatedDecodeState.StaticFallback
                 }
             }
-            val header = MediaPreviewLoader.readHeaderPrefix(ctx, uri)
-            if (!MediaPreviewSupport.isAnimatedImageHeader(header)) {
-                return@withContext AnimatedDecodeState.StaticFallback
-            }
             val source = runCatching {
                 if (uri.scheme.equals("file", ignoreCase = true)) {
-                    ImageDecoder.createSource(File(uri.path ?: return@runCatching null))
+                    val path = uri.path ?: return@runCatching null
+                    if (!FileInfo.isRegularFileNoFollow(path)) return@runCatching null
+                    ImageDecoder.createSource(File(path))
                 } else {
                     ImageDecoder.createSource(ctx.contentResolver, uri)
                 }
-            }.getOrNull() ?: return@withContext AnimatedDecodeState.StaticFallback
-            val decoded = MediaPreviewLoader.decodeAnimatedDrawable(source)
-            if (decoded is Animatable) {
-                AnimatedDecodeState.Animated(decoded)
-            } else {
-                AnimatedDecodeState.StaticFallback
+            }.getOrNull() ?: return@withContext AnimatedDecodeState.RejectedUnsafeOrOversized
+
+            when (val res = MediaPreviewLoader.decodeAnimatedResult(source)) {
+                is AnimatedDrawableResult.Decoded -> {
+                    if (res.drawable is Animatable) {
+                        AnimatedDecodeState.Animated(res.drawable)
+                    } else {
+                        AnimatedDecodeState.StaticFallback
+                    }
+                }
+                AnimatedDrawableResult.RejectedBounds -> AnimatedDecodeState.RejectedUnsafeOrOversized
+                AnimatedDrawableResult.Unavailable -> AnimatedDecodeState.StaticFallback
             }
         }
     }
 
     when (val state = decodeState) {
         AnimatedDecodeState.Loading -> CircularProgressIndicator()
+        AnimatedDecodeState.RejectedUnsafeOrOversized -> {
+            val lastBodyReq = rememberQuickLookBodyLastRequester()
+            val message = stringResource(R.string.quicklook_cant_render_image)
+            if (onOpenExternal != null) {
+                MediaErrorFallback(
+                    entry = e,
+                    message = message,
+                    lastFocusRequester = lastBodyReq,
+                    onOpenExternal = onOpenExternal,
+                )
+            } else {
+                Column(
+                    modifier = Modifier.padding(24.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(16.dp),
+                ) {
+                    Icon(e.icon(), null, Modifier.size(88.dp), tint = e.tint())
+                    Text(message, style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onSurfaceVariant, textAlign = TextAlign.Center)
+                }
+            }
+        }
         AnimatedDecodeState.StaticFallback -> {
             AsyncImage(
                 remember(fallbackModel, e.modified) { ImageRequest.Builder(ctx).data(fallbackModel).size(2048).build() },
@@ -847,30 +1004,41 @@ internal fun AnimatedImagePreview(
             )
         }
         is AnimatedDecodeState.Animated -> {
+            val lifecycleOwner = LocalLifecycleOwner.current
             val drawable = state.drawable
             val animatable = drawable as Animatable
-            var playing by remember(drawable) { mutableStateOf(true) }
+            var playing by remember(drawable) {
+                mutableStateOf(lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED))
+            }
             val lastBodyReq = rememberQuickLookBodyLastRequester()
+
+            fun stopAnimation() {
+                if (playing || animatable.isRunning) {
+                    runCatching { animatable.stop() }
+                    playing = false
+                }
+            }
 
             fun toggle() {
                 if (playing) {
-                    animatable.stop()
-                    playing = false
+                    stopAnimation()
                 } else {
-                    animatable.start()
+                    runCatching { animatable.start() }
                     playing = true
                 }
             }
 
-            LifecycleEventEffect(Lifecycle.Event.ON_PAUSE) {
-                if (playing) {
-                    animatable.stop()
-                    playing = false
-                }
-            }
+            LifecycleEventEffect(Lifecycle.Event.ON_PAUSE) { stopAnimation() }
+            LifecycleEventEffect(Lifecycle.Event.ON_STOP) { stopAnimation() }
 
             DisposableEffect(drawable) {
-                animatable.start()
+                if (lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) {
+                    runCatching { animatable.start() }
+                    playing = true
+                } else {
+                    runCatching { animatable.stop() }
+                    playing = false
+                }
                 onDispose { runCatching { animatable.stop() } }
             }
 
@@ -890,6 +1058,8 @@ internal fun AnimatedImagePreview(
                 AndroidView(
                     factory = { context ->
                         ImageView(context).apply {
+                            isFocusable = false
+                            isFocusableInTouchMode = false
                             scaleType = ImageView.ScaleType.FIT_CENTER
                             adjustViewBounds = true
                             contentDescription = e.name
@@ -908,6 +1078,7 @@ internal fun AnimatedImagePreview(
                     modifier = Modifier
                         .fillMaxSize()
                         .padding(8.dp)
+                        .focusProperties { canFocus = false }
                         .clickable(noRipple, indication = null) { toggle() },
                 )
 
