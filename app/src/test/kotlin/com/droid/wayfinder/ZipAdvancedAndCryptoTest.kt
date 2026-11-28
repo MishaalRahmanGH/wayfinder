@@ -1148,32 +1148,47 @@ class ZipAdvancedAndCryptoTest {
         val safFiles = LinkedHashMap<String, ByteArray>().apply {
             put("saf://tree1/report.pdf", "original-pdf".toByteArray(Charsets.UTF_8))
         }
+        val safDirs = LinkedHashSet<String>().apply {
+            add("saf://tree1")
+        }
         val safMimes = LinkedHashMap<String, String>().apply {
             put("saf://tree1/report.pdf", "application/pdf")
         }
         var safDeletes = 0
         val fakeSaf = object : FileSystem {
-            override fun list(path: String): List<FileEntry> = safFiles.keys
-                .filter { FsPath.parent(it) == path }
-                .map { FileEntry(it, FsPath.name(it), false, size = safFiles[it]!!.size.toLong(), modified = 1000L) }
-            override fun stat(path: String): FileEntry? =
-                if (path == "saf://tree1") FileEntry(path, "tree1", true, modified = 1000L)
-                else safFiles[path]?.let { FileEntry(path, FsPath.name(path), false, size = it.size.toLong(), modified = 1000L) }
-            override fun mkdir(path: String) {}
+            override fun list(path: String): List<FileEntry> {
+                val fileKids = safFiles.keys
+                    .filter { FsPath.parent(it) == path }
+                    .map { FileEntry(it, FsPath.name(it), false, size = safFiles[it]!!.size.toLong(), modified = 1000L) }
+                val dirKids = safDirs
+                    .filter { it != path && FsPath.parent(it) == path }
+                    .map { FileEntry(it, FsPath.name(it), true, modified = 1000L) }
+                return dirKids + fileKids
+            }
+            override fun stat(path: String): FileEntry? = when {
+                path in safDirs -> FileEntry(path, FsPath.name(path), true, modified = 1000L)
+                safFiles.containsKey(path) -> FileEntry(path, FsPath.name(path), false, size = safFiles[path]!!.size.toLong(), modified = 1000L)
+                else -> null
+            }
+            override fun mkdir(path: String) { safDirs += path }
             override fun createFile(path: String) {
                 safFiles[path] = ByteArray(0)
                 safMimes.putIfAbsent(path, if (path.endsWith(".pdf")) "application/pdf" else "application/octet-stream")
             }
             override fun delete(path: String) {
                 safDeletes++
-                safFiles.remove(path)
-                safMimes.remove(path)
+                safDirs.removeIf { it == path || it.startsWith("$path/") }
+                safFiles.keys.filter { it == path || it.startsWith("$path/") }.forEach {
+                    safFiles.remove(it)
+                    safMimes.remove(it)
+                }
             }
             override fun rename(path: String, newName: String): String =
                 throw UnsupportedOperationException("DocumentsProvider does not support renameDocument")
             override fun openInput(path: String): InputStream =
                 (safFiles[path] ?: throw IOException("404")).inputStream()
             override fun openOutput(path: String): OutputStream {
+                if (path in safDirs) throw IOException("Is a directory: $path")
                 safMimes.putIfAbsent(path, if (path.endsWith(".pdf")) "application/pdf" else "application/octet-stream")
                 return object : ByteArrayOutputStream() {
                     override fun close() {
@@ -1253,6 +1268,29 @@ class ZipAdvancedAndCryptoTest {
         assertEquals("updated-pdf-payload", String(safFiles["saf://tree1/report.pdf"]!!, Charsets.UTF_8))
         assertEquals("application/pdf", safMimes["saf://tree1/report.pdf"])
         assertEquals(0, safDeletes)
+
+        // Replacing an existing SAF *directory* with a regular file (`!srcStat.isDir && dstStat.isDir`):
+        // wrong password leaves the directory intact; valid password stages as a file (not `mkdirs()`), deletes the
+        // directory, and writes the replacement regular file without `FileNotFoundException: Is a directory`.
+        safFiles.remove("saf://tree1/report.pdf")
+        safMimes.remove("saf://tree1/report.pdf")
+        safDirs += "saf://tree1/report.pdf"
+        safFiles["saf://tree1/report.pdf/inside.txt"] = "nested".toByteArray(Charsets.UTF_8)
+
+        customRepo.zip.setPassword(zipFile.path, "wrong-pw")
+        try {
+            customOps.transfer(listOf(entryOnCustom), "saf://tree1", move = false, conflict = Conflict.Replace) {}
+            fail("Expected wrong password failure when replacing SAF directory with file")
+        } catch (_: ZipPasswordRequiredException) {
+        }
+        assertTrue("Existing SAF directory must remain intact on wrong password", "saf://tree1/report.pdf" in safDirs)
+        assertEquals("nested", String(safFiles["saf://tree1/report.pdf/inside.txt"]!!, Charsets.UTF_8))
+
+        customRepo.zip.setPassword(zipFile.path, "pdf-pw")
+        customOps.transfer(listOf(entryOnCustom), "saf://tree1", move = false, conflict = Conflict.Replace) {}
+        assertFalse("Replaced SAF directory must be removed", "saf://tree1/report.pdf" in safDirs)
+        assertEquals("updated-pdf-payload", String(safFiles["saf://tree1/report.pdf"]!!, Charsets.UTF_8))
+        assertEquals(0, File(sandbox, "replace-stage").listFiles()?.size ?: 0)
 
         // Path-addressed provider WITHOUT rename: wrong password leaves target intact; valid password replaces without data loss.
         customRepo.zip.setPassword(zipFile.path, "wrong-pw")

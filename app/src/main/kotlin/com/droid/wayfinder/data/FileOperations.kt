@@ -247,10 +247,10 @@ class FileOperations(
                     if (usesInPlaceFileReplace(target) && !srcStat.isDir && dstStat?.isDir != true) {
                         state = replaceFileViaLocalStage(src, target, destFs, state, onProgress)
                     } else if (usesInPlaceFileReplace(target)) {
-                        // Directory replacement on document-ID backed providers where sibling rename is unsupported:
-                        // stage the full source tree into local cache first so encrypted ZIP / remote reads complete
-                        // and verify before touching the destination directory.
-                        val localTree = File(stagingDir(), "wf-replace-tree-${System.nanoTime()}").apply { mkdirs() }
+                        // Directory-involved replacement on document-ID backed providers where sibling rename is
+                        // unsupported: stage the source file or tree into local cache first so encrypted ZIP / remote
+                        // reads complete and verify before touching the destination item.
+                        val localTree = File(stagingDir(), "wf-replace-tree-${System.nanoTime()}")
                         try {
                             state = copyTreeToLocalStage(src, localTree, state, onProgress)
                             destFs.delete(target)

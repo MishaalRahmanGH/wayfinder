@@ -213,11 +213,7 @@ class SafAndDocumentsProviderCoverageTest {
         override fun openFile(uri: Uri, mode: String): ParcelFileDescriptor {
             val docId = DocumentsContract.getDocumentId(uri)
             val node = nodes[docId] ?: throw FileNotFoundException(docId)
-            val pfdMode = if (mode.startsWith("w")) {
-                ParcelFileDescriptor.MODE_WRITE_ONLY or ParcelFileDescriptor.MODE_CREATE or ParcelFileDescriptor.MODE_TRUNCATE
-            } else {
-                ParcelFileDescriptor.MODE_READ_ONLY
-            }
+            val pfdMode = ParcelFileDescriptor.parseMode(mode)
             return ParcelFileDescriptor.open(node.backingFile, pfdMode)
         }
 
@@ -341,10 +337,13 @@ class SafAndDocumentsProviderCoverageTest {
         assertEquals("hello.txt", docStat!!.name)
 
         docFs.openOutput("doc://$authority/primary:Work/hello.txt").use {
+            it.write("B".repeat(1_000).toByteArray())
+        }
+        docFs.openOutput("doc://$authority/primary:Work/hello.txt").use {
             it.write("doc updated".toByteArray())
         }
         val docRead = docFs.openInput("doc://$authority/primary:Work/hello.txt").use { it.readBytes().decodeToString() }
-        assertEquals("doc updated", docRead)
+        assertEquals("DocFileSystem.openOutput must truncate trailing bytes on overwrite", "doc updated", docRead)
 
         docFs.mkdir("doc://$authority/primary:Work/DocSub")
         docFs.createFile("doc://$authority/primary:Work/DocSub/item.bin")

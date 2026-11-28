@@ -515,7 +515,8 @@ class DocFileSystem(private val context: Context) : RemoteFileSystem {
             createdId
         }
         val docUri = DocumentsContract.buildDocumentUri(auth, targetDocId)
-        return runCatching { context.contentResolver.openOutputStream(docUri, "w") }.getOrNull()
+        return runCatching { context.contentResolver.openOutputStream(docUri, "wt") }.getOrNull()
+            ?: runCatching { context.contentResolver.openOutputStream(docUri, "w") }.getOrNull()
             ?: context.contentResolver.openOutputStream(docUri)
             ?: throw IOException("Cannot write to $path")
     }
