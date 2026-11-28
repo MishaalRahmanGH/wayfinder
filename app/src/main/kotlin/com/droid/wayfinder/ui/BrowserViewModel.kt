@@ -2362,8 +2362,12 @@ class BrowserViewModel(private val app: Application, handle: SavedStateHandle) :
                         }
                     }
                 } else if (com.droid.wayfinder.data.ApkInspector.isInspectableApk(single)) {
+                    val unsafeLocal = single.isLink ||
+                        (FsPath.isLocalFile(single.path) && isUnsafeToExpose(single.path))
                     val canInspectLocally = FsPath.isLocalFile(single.path) || isLocalDocumentEntry(single)
-                    if (!canInspectLocally) {
+                    if (unsafeLocal) {
+                        patch { it.copy(apkLoading = false, apkError = str(com.droid.wayfinder.R.string.properties_apk_unavailable)) }
+                    } else if (!canInspectLocally) {
                         patch { it.copy(apkLoading = false, apkError = str(com.droid.wayfinder.R.string.properties_apk_local_only)) }
                     } else {
                         patch { it.copy(apkLoading = true, apkError = null) }
@@ -2462,7 +2466,9 @@ class BrowserViewModel(private val app: Application, handle: SavedStateHandle) :
     }
 
     private suspend fun inspectApkEntry(entry: FileEntry): com.droid.wayfinder.data.ApkInfo? {
+        if (entry.isLink) return null
         if (FsPath.isLocalFile(entry.path)) {
+            if (isUnsafeToExpose(entry.path)) return null
             return com.droid.wayfinder.data.ApkInspector.inspectFile(app, File(entry.path))
         }
         if (isLocalDocumentEntry(entry)) {

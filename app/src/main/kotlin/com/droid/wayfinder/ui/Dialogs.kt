@@ -450,24 +450,15 @@ private fun ApkPropertiesSection(
     onCopy: (text: String, what: String) -> Unit,
 ) {
     val sectionTitle = stringResource(R.string.properties_apk_section)
-    Row(
-        Modifier.fillMaxWidth().padding(top = 8.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.SpaceBetween,
-    ) {
-        Text(sectionTitle, style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
-        if (info != null) {
-            val copyDesc = stringResource(R.string.properties_apk_copy)
-            ActionTooltip(copyDesc) {
-                IconButton(
-                    onClick = { onCopy(ApkFormatters.formatSummary(info), sectionTitle) },
-                    modifier = Modifier.size(48.dp).focusRing(androidx.compose.foundation.shape.CircleShape),
-                ) {
-                    Icon(Icons.Outlined.ContentCopy, copyDesc, Modifier.size(16.dp))
-                }
-            }
-        }
-    }
+    PropertiesSectionHeader(
+        title = sectionTitle,
+        copyDescription = if (info != null) stringResource(R.string.properties_apk_copy) else null,
+        onCopy = if (info != null) {
+            { onCopy(ApkFormatters.formatSummary(info), sectionTitle) }
+        } else {
+            null
+        },
+    )
     if (loading) {
         Text(stringResource(R.string.properties_apk_inspecting), style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
         return
@@ -488,26 +479,36 @@ private fun ApkPropertiesSection(
     ApkFormatters.formatSdk(info.minSdk)?.let {
         Row2(stringResource(R.string.properties_apk_min_sdk_label), it, mono = true)
     }
-    ApkFormatters.formatAbis(info.supportedAbis, info.zipInspected)?.let {
+    ApkFormatters.formatAbis(info.supportedAbis, info.zipInspected, info.zipTruncated)?.let {
         Row2(stringResource(R.string.properties_apk_abis_label), it, mono = true)
+    }
+    if (info.signatureStatus == ApkSignatureStatus.LegacyV1JarOnly) {
+        Row2(stringResource(R.string.properties_apk_signature_label), stringResource(R.string.properties_apk_legacy_v1))
+    } else if (info.certificates.isEmpty() && info.signatureStatus == ApkSignatureStatus.UnsignedOrUnverified) {
+        Row2(stringResource(R.string.properties_apk_signature_label), stringResource(R.string.properties_apk_unsigned))
     }
     info.packageName?.let { pkg ->
         val label = stringResource(R.string.properties_apk_package_label)
         Row2(label, pkg, mono = true) { onCopy(pkg, label) }
     }
     if (info.certificates.isNotEmpty()) {
-        val certBase = stringResource(R.string.properties_apk_cert_sha256_label)
-        val signerBase = stringResource(R.string.properties_apk_signer_label)
+        val multiCert = info.certificates.size > 1
         info.certificates.forEachIndexed { idx, cert ->
-            val certLabel = if (info.certificates.size > 1) "$certBase #${idx + 1}" else certBase
+            val certLabel = if (multiCert) {
+                stringResource(R.string.properties_apk_cert_sha256_indexed_label, idx + 1)
+            } else {
+                stringResource(R.string.properties_apk_cert_sha256_label)
+            }
             Row2(certLabel, cert.sha256Fingerprint, mono = true) { onCopy(cert.sha256Fingerprint, certLabel) }
             cert.subject?.let { subj ->
-                val signerLabel = if (info.certificates.size > 1) "$signerBase #${idx + 1}" else signerBase
+                val signerLabel = if (multiCert) {
+                    stringResource(R.string.properties_apk_signer_indexed_label, idx + 1)
+                } else {
+                    stringResource(R.string.properties_apk_signer_label)
+                }
                 Row2(signerLabel, subj, mono = true) { onCopy(subj, signerLabel) }
             }
         }
-    } else if (info.signatureStatus == ApkSignatureStatus.UnsignedOrUnverified) {
-        Row2(stringResource(R.string.properties_apk_signature_label), stringResource(R.string.properties_apk_unsigned))
     }
 }
 

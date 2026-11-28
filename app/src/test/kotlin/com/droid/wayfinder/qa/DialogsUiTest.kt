@@ -22,6 +22,7 @@ import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performTextInput
 import androidx.compose.ui.test.performTextReplacement
 import androidx.compose.ui.unit.dp
@@ -373,6 +374,10 @@ class DialogsUiTest {
             ),
         ); idle()
         rule.onNodeWithText("Android Package").assertExists()
+        assertTrue(
+            androidx.compose.ui.semantics.SemanticsProperties.Heading in
+                rule.onNodeWithText("Android Package").fetchSemanticsNode().config,
+        )
         rule.onNodeWithText("Sample App").assertExists()
         rule.onNodeWithText("com.example.sample").assertExists()
         rule.onNodeWithText("2.1.0 (42)").assertExists()
@@ -382,16 +387,31 @@ class DialogsUiTest {
         rule.onNodeWithText("Cert SHA-256").assertExists()
         rule.onNodeWithText(certSha).assertExists()
         rule.onNodeWithText("CN=Sample Dev").assertExists()
-        rule.onNodeWithContentDescription("Copy Signer").performClick(); idle()
+        rule.onNodeWithContentDescription("Copy Signer").performScrollTo().performClick(); idle()
         val copiedSigner = h.events.filterIsInstance<UiEvent.CopyText>().last()
         assertEquals("Signer", copiedSigner.what)
         assertEquals("CN=Sample Dev", copiedSigner.text)
         rule.onNodeWithText("Unsigned or unverified").assertDoesNotExist()
-        rule.onNodeWithContentDescription("Copy APK info").performClick(); idle()
+        rule.onNodeWithText("Legacy v1 (JAR only)").assertDoesNotExist()
+        rule.onNodeWithContentDescription("Copy APK info").performScrollTo().performClick(); idle()
         val copied = h.events.filterIsInstance<UiEvent.CopyText>().last()
         assertEquals("Android Package", copied.what)
         assertTrue(copied.text.contains("Package: com.example.sample"))
         assertTrue(copied.text.contains("Cert SHA-256: $certSha"))
+
+        // Legacy v1 JAR-only signed APK surfaces the explicit warning row alongside certificate info.
+        h.vm.showDialog(
+            Dialog.Properties(
+                entries = listOf(entry),
+                apkInfo = com.droid.wayfinder.data.ApkInfo(
+                    packageName = "com.example.legacy",
+                    targetSdk = 28,
+                    certificates = listOf(com.droid.wayfinder.data.ApkCertificateInfo(certSha, "CN=Legacy Dev")),
+                    signatureStatus = com.droid.wayfinder.data.ApkSignatureStatus.LegacyV1JarOnly,
+                ),
+            ),
+        ); idle()
+        rule.onNodeWithText("Legacy v1 (JAR only)").assertExists()
         rule.onNodeWithText("Close").performClick(); idle()
         assertNull(h.s.dialog)
     }
