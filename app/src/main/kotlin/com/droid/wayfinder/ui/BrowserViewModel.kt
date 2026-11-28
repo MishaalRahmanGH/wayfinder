@@ -1194,7 +1194,7 @@ class BrowserViewModel(private val app: Application, handle: SavedStateHandle) :
             com.droid.wayfinder.MainActivity.isApkName(entry.name) &&
                 (FsPath.isVirtual(tab.path) || tab.searchResults != null || FsPath.parent(entry.path) != tab.path) ->
                 showInEnclosingFolder(entry.path)
-            else -> openFile(entry.path)
+            else -> openFile(entry.path, displayName = entry.name)
         }
     }
 
@@ -1227,7 +1227,7 @@ class BrowserViewModel(private val app: Application, handle: SavedStateHandle) :
     /** "Open with…": always offers the app chooser. */
     fun openWith() {
         val e = tab.selectedEntries(hidden).singleOrNull()?.takeIf { !it.isDir && !it.isServer && !it.isShare } ?: return
-        openFile(e.path, chooser = true)
+        openFile(e.path, chooser = true, displayName = e.name)
     }
 
     fun openSelection(newTab: Boolean = false) {
@@ -1246,36 +1246,70 @@ class BrowserViewModel(private val app: Application, handle: SavedStateHandle) :
         emit(UiEvent.OpenSystemFilesFolder(folderUri))
     }
 
-    private fun openFile(path: String, chooser: Boolean = false) {
+    fun openApkWithNonInstallerApp(path: String) {
+        dismissDialog()
+        if (path.isBlank() || trash.isInTrash(path)) return
+        openFile(
+            path = path,
+            chooser = true,
+            bypassApkDisclosure = true,
+            excludePackageInstallers = true,
+        )
+    }
+
+    private fun openFile(
+        path: String,
+        chooser: Boolean = false,
+        displayName: String? = null,
+        bypassApkDisclosure: Boolean = false,
+        excludePackageInstallers: Boolean = false,
+    ) {
         setCompactSidebarOpen(false)
         if (FsPath.isLocalFile(path) && isUnsafeToExpose(path)) {
             toast("This file can't be opened")
             return
         }
-        if (com.droid.wayfinder.data.SystemFilesHandoff.isApkFile(path)) {
-            val folderUri = if (trash.isInTrash(path)) {
-                null
+        if (!bypassApkDisclosure && com.droid.wayfinder.data.SystemFilesHandoff.isApkFile(path, displayName)) {
+            val shownName = displayName?.takeIf { it.isNotBlank() } ?: FsPath.name(path).ifEmpty { path }
+            val inTrash = trash.isInTrash(path)
+            val actionPath = if (inTrash) "" else path
+            if (inTrash) {
+                showDialog(Dialog.ApkInstallUnsupported(fileName = shownName, folderUri = null, path = ""))
+                return
+            }
+            val eligibleParent = com.droid.wayfinder.data.SystemFilesHandoff.eligibleParentFolder(
+                apkPath = path,
+                primaryStorageRoot = primary,
+                safMounts = safMounts,
+            )
+            if (eligibleParent != null && FsPath.isSaf(eligibleParent)) {
+                viewModelScope.launch {
+                    val folderUri = withContext(Dispatchers.IO) {
+                        com.droid.wayfinder.data.SystemFilesHandoff.folderDocumentsUriForApk(
+                            apkPath = path,
+                            safMounts = safMounts,
+                            primaryStorageRoot = primary,
+                            resolveSafDocumentUri = saf::documentUriOf,
+                        )
+                    }
+                    showDialog(Dialog.ApkInstallUnsupported(fileName = shownName, folderUri = folderUri, path = actionPath))
+                }
             } else {
-                com.droid.wayfinder.data.SystemFilesHandoff.folderDocumentsUriForApk(
+                val folderUri = com.droid.wayfinder.data.SystemFilesHandoff.folderDocumentsUriForApk(
                     apkPath = path,
                     safMounts = safMounts,
                     primaryStorageRoot = primary,
                 )
+                showDialog(Dialog.ApkInstallUnsupported(fileName = shownName, folderUri = folderUri, path = actionPath))
             }
-            showDialog(
-                Dialog.ApkInstallUnsupported(
-                    fileName = FsPath.name(path).ifEmpty { path },
-                    folderUri = folderUri,
-                ),
-            )
             return
         }
         if (FsPath.isLocalFile(path)) {
             if (!com.droid.wayfinder.data.LocalUriResolver.anyMayResolveExternalLocalUri(app, listOf(path))) {
                 if (isDirectlyServableByFileProvider(path)) {
-                    emit(UiEvent.OpenFile(path, chooser))
+                    emit(UiEvent.OpenFile(path, chooser, excludePackageInstallers = excludePackageInstallers))
                 } else {
-                    stageAndOpenFile(path, chooser)
+                    stageAndOpenFile(path, chooser, excludePackageInstallers)
                 }
                 return
             }
@@ -1289,9 +1323,9 @@ class BrowserViewModel(private val app: Application, handle: SavedStateHandle) :
                     )
                 }
                 when {
-                    directUri != null -> emit(UiEvent.OpenFile(path, chooser, uri = directUri))
-                    isDirectlyServableByFileProvider(path) -> emit(UiEvent.OpenFile(path, chooser))
-                    else -> stageAndOpenFile(path, chooser)
+                    directUri != null -> emit(UiEvent.OpenFile(path, chooser, uri = directUri, excludePackageInstallers = excludePackageInstallers))
+                    isDirectlyServableByFileProvider(path) -> emit(UiEvent.OpenFile(path, chooser, excludePackageInstallers = excludePackageInstallers))
+                    else -> stageAndOpenFile(path, chooser, excludePackageInstallers)
                 }
             }
             return
@@ -1300,14 +1334,14 @@ class BrowserViewModel(private val app: Application, handle: SavedStateHandle) :
             viewModelScope.launch {
                 val directUri = withContext(Dispatchers.IO) { resolveDirectOpenDocumentUri(path) }
                 if (directUri != null) {
-                    emit(UiEvent.OpenFile(path, chooser, uri = directUri))
+                    emit(UiEvent.OpenFile(path, chooser, uri = directUri, excludePackageInstallers = excludePackageInstallers))
                 } else {
-                    stageAndOpenFile(path, chooser)
+                    stageAndOpenFile(path, chooser, excludePackageInstallers)
                 }
             }
             return
         }
-        stageAndOpenFile(path, chooser)
+        stageAndOpenFile(path, chooser, excludePackageInstallers)
     }
 
     private fun resolveDirectOpenDocumentUri(path: String): Uri? {
@@ -1319,7 +1353,7 @@ class BrowserViewModel(private val app: Application, handle: SavedStateHandle) :
         return docUri.takeIf { hasSelfReadUriGrant(app, it) }
     }
 
-    private fun stageAndOpenFile(path: String, chooser: Boolean) {
+    private fun stageAndOpenFile(path: String, chooser: Boolean, excludePackageInstallers: Boolean = false) {
         // Network files, archive entries, and removable/Linux local volumes outside FileProvider roots
         // are staged into cacheDir first so external apps receive a valid FileProvider URI.
         val zip = FsPath.isZip(path)
@@ -1328,7 +1362,7 @@ class BrowserViewModel(private val app: Application, handle: SavedStateHandle) :
             ops.transfer(listOf(path), dir.path, move = false, conflict = Conflict.Replace, onProgress = report)
         }) { res ->
             val target = res.firstOrNull()?.target ?: File(dir, FileInfo.sanitizeFileName(FsPath.name(path), "file")).path
-            emit(UiEvent.OpenFile(target, chooser))
+            emit(UiEvent.OpenFile(target, chooser, excludePackageInstallers = excludePackageInstallers))
         }
     }
 
@@ -1926,7 +1960,7 @@ class BrowserViewModel(private val app: Application, handle: SavedStateHandle) :
                         } else {
                             if (parent != null && tab.path != parent) navigate(parent, select = path)
                             else if (parent != null) updateTab(tab.id) { it.copy(selection = setOf(path), anchor = path, focused = path) }
-                            openFile(path)
+                            openFile(path, displayName = localEntry.name)
                         }
                     }
                     return@launch
@@ -1942,7 +1976,7 @@ class BrowserViewModel(private val app: Application, handle: SavedStateHandle) :
                 } else {
                     if (parent != null && tab.path != parent) navigate(parent, select = path)
                     else if (parent != null) updateTab(tab.id) { it.copy(selection = setOf(path), anchor = path, focused = path) }
-                    openFile(path)
+                    openFile(path, displayName = stat.name)
                 }
             } else {
                 if (newTab) newTab(path, activate = false) else navigate(path)

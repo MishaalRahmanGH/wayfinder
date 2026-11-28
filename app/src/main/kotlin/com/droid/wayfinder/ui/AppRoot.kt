@@ -362,7 +362,7 @@ fun AppRoot(vm: BrowserViewModel) {
 
         vm.events.collect { e ->
             when (e) {
-                is UiEvent.OpenFile -> openWithSystem(ctx, e.path, e.chooser, e.uri)
+                is UiEvent.OpenFile -> openWithSystem(ctx, e.path, e.chooser, e.uri, e.excludePackageInstallers)
                 is UiEvent.Share -> shareFiles(ctx, e.paths, e.uris)
                 is UiEvent.CopyText -> {
                     ctx.getSystemService(ClipboardManager::class.java).setPrimaryClip(ClipData.newPlainText(e.what, e.text))
@@ -1570,6 +1570,7 @@ private fun openWithSystem(
     path: String,
     chooser: Boolean = false,
     preferredUri: android.net.Uri? = null,
+    excludePackageInstallers: Boolean = false,
 ) {
     val displayName = FsPath.name(path).ifEmpty { File(path).name }
     val i = buildOpenWithSystemIntent(ctx, path, preferredUri, allowSyncLookup = false)
@@ -1579,13 +1580,18 @@ private fun openWithSystem(
         return
     }
     val selfComponent = android.content.ComponentName(ctx, MainActivity::class.java)
-    fun chooserExcludingSelf(target: Intent): Intent = Intent.createChooser(target, "Open with").apply {
+    fun chooserExcluding(target: Intent): Intent = Intent.createChooser(target, "Open with").apply {
         if (android.os.Build.VERSION.SDK_INT >= 24) {
-            putExtra(Intent.EXTRA_EXCLUDE_COMPONENTS, arrayOf(selfComponent))
+            val excluded = if (excludePackageInstallers) {
+                com.droid.wayfinder.data.SystemFilesHandoff.excludedApkChooserComponents(ctx, target, selfComponent)
+            } else {
+                arrayOf(selfComponent)
+            }
+            putExtra(Intent.EXTRA_EXCLUDE_COMPONENTS, excluded)
         }
     }
-    fun selectLaunchIntent(base: Intent): Intent = if (chooser) {
-        chooserExcludingSelf(base)
+    fun selectLaunchIntent(base: Intent): Intent = if (chooser || excludePackageInstallers) {
+        chooserExcluding(base)
     } else {
         val resolved = runCatching { ctx.packageManager.queryIntentActivities(base, 0) }.getOrDefault(emptyList())
         val matchesSelf = resolved.any { it.activityInfo?.packageName == ctx.packageName }
@@ -1597,7 +1603,7 @@ private fun openWithSystem(
             if (external.size == 1) {
                 Intent(base).setClassName(external[0].packageName, external[0].name)
             } else {
-                chooserExcludingSelf(base)
+                chooserExcluding(base)
             }
         }
     }
@@ -1622,7 +1628,7 @@ private fun openWithSystem(
             val fallback = Intent(i).setDataAndType(uri, "*/*").apply {
                 clipData = ClipData.newRawUri("", uri)
             }
-            ctx.startActivity(chooserExcludingSelf(fallback))
+            ctx.startActivity(chooserExcluding(fallback))
         } catch (_: Exception) {
             android.widget.Toast.makeText(ctx, "No app can open $displayName", android.widget.Toast.LENGTH_SHORT).show()
         }

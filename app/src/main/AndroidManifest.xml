@@ -26,6 +26,8 @@
         <package android:name="com.android.mtp" />
         <package android:name="com.google.android.documentsui" />
         <package android:name="com.android.documentsui" />
+        <package android:name="com.google.android.packageinstaller" />
+        <package android:name="com.android.packageinstaller" />
         <intent>
             <action android:name="android.content.action.DOCUMENTS_PROVIDER" />
         </intent>

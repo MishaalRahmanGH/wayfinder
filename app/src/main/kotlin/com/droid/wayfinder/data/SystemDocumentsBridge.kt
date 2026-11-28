@@ -241,7 +241,11 @@ object SystemDocumentsBridge {
             val mount = safMounts.firstOrNull { it.id == id } ?: return null
             val treeUri = runCatching { Uri.parse(mount.uri) }.getOrNull() ?: return null
             val baseDocId = runCatching { DocumentsContract.getTreeDocumentId(treeUri) }.getOrNull() ?: return null
-            val targetDocId = if (rel.isEmpty()) baseDocId else "$baseDocId/$rel"
+            val targetDocId = when {
+                rel.isEmpty() -> baseDocId
+                baseDocId.endsWith(':') -> "$baseDocId$rel"
+                else -> "$baseDocId/$rel"
+            }
             return if (tree && rel.isEmpty()) {
                 treeUri
             } else if (tree) {
@@ -483,7 +487,9 @@ class DocFileSystem(private val context: Context) : RemoteFileSystem {
                     val mod = c.getLong(c.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_LAST_MODIFIED))
                     val summaryCol = c.getColumnIndex(DocumentsContract.Document.COLUMN_SUMMARY)
                     val summary = if (summaryCol >= 0 && !c.isNull(summaryCol)) c.getString(summaryCol)?.takeIf { it.isNotBlank() } else null
-                    FileEntry("doc://$auth/$docId", name, isDir, size, if (mod > 0) mod else System.currentTimeMillis(), subtitle = summary)
+                    val docPath = "doc://$auth/$docId"
+                    SystemDocumentsBridge.registerNode(docPath, name)
+                    FileEntry(docPath, name, isDir, size, if (mod > 0) mod else System.currentTimeMillis(), subtitle = summary)
                 } else null
             }
         }.getOrNull()

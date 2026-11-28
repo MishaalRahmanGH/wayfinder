@@ -85,6 +85,7 @@ object LocalUriResolver {
         "oga" to "audio/ogg",
         "opus" to "audio/opus",
         "wav" to "audio/wav",
+        "apk" to "application/vnd.android.package-archive",
     )
 
     fun mimeTypeForPath(path: String): String? {

@@ -117,6 +117,7 @@ fun Dialogs(vm: BrowserViewModel, s: AppState) {
             d = d,
             onDismiss = vm::dismissDialog,
             onOpenInFiles = vm::openApkFolderInSystemFiles,
+            onOpenWithOtherApp = vm::openApkWithNonInstallerApp,
         )
     }
 }
@@ -902,8 +903,10 @@ private fun ApkInstallUnsupportedDialog(
     d: Dialog.ApkInstallUnsupported,
     onDismiss: () -> Unit,
     onOpenInFiles: (android.net.Uri) -> Unit,
+    onOpenWithOtherApp: (String) -> Unit,
 ) {
     val folderUri = d.folderUri
+    val canOpenWithOther = d.path.isNotBlank()
     AlertDialog(
         onDismissRequest = onDismiss,
         properties = DialogProperties(usePlatformDefaultWidth = false),
@@ -921,18 +924,58 @@ private fun ApkInstallUnsupportedDialog(
                 color = MaterialTheme.colorScheme.onSurface,
             )
         },
-        dismissButton = if (folderUri != null) {
-            { TextButton(onClick = onDismiss) { Text(stringResource(R.string.action_close)) } }
-        } else {
-            null
-        },
         confirmButton = {
-            if (folderUri != null) {
-                Button(onClick = { onOpenInFiles(folderUri) }) {
-                    Text(stringResource(R.string.apk_install_open_in_files))
+            @OptIn(ExperimentalLayoutApi::class)
+            BoxWithConstraints(Modifier.fillMaxWidth()) {
+                if (maxWidth < 460.dp) {
+                    Column(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        if (folderUri != null) {
+                            Button(
+                                onClick = { onOpenInFiles(folderUri) },
+                                modifier = Modifier.fillMaxWidth(),
+                            ) {
+                                Text(stringResource(R.string.apk_install_open_in_files), maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            }
+                        }
+                        if (canOpenWithOther) {
+                            OutlinedButton(
+                                onClick = { onOpenWithOtherApp(d.path) },
+                                modifier = Modifier.fillMaxWidth(),
+                            ) {
+                                Text(stringResource(R.string.apk_install_open_with_other), maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            }
+                        }
+                        TextButton(
+                            onClick = onDismiss,
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Text(stringResource(R.string.action_close), maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        }
+                    }
+                } else {
+                    FlowRow(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End),
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        TextButton(onClick = onDismiss) {
+                            Text(stringResource(R.string.action_close), maxLines = 1)
+                        }
+                        if (canOpenWithOther) {
+                            OutlinedButton(onClick = { onOpenWithOtherApp(d.path) }) {
+                                Text(stringResource(R.string.apk_install_open_with_other), maxLines = 1)
+                            }
+                        }
+                        if (folderUri != null) {
+                            Button(onClick = { onOpenInFiles(folderUri) }) {
+                                Text(stringResource(R.string.apk_install_open_in_files), maxLines = 1)
+                            }
+                        }
+                    }
                 }
-            } else {
-                TextButton(onClick = onDismiss) { Text(stringResource(R.string.action_close)) }
             }
         },
     )

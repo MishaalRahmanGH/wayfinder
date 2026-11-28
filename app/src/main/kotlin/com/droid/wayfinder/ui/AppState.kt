@@ -74,10 +74,11 @@ sealed interface Dialog {
     data object About : Dialog
     /** First-install / on-demand guide for setting or resetting Wayfinder as the default file handler. */
     data object DefaultHandler : Dialog
-    /** Disclosure shown when attempting to open an `.apk` file, with optional handoff to the system Files app. */
+    /** Disclosure shown when attempting to open an `.apk` file, with optional handoff to the system Files app or non-installer APK tools. */
     data class ApkInstallUnsupported(
         val fileName: String,
         val folderUri: android.net.Uri? = null,
+        val path: String = "",
     ) : Dialog
 }
 
@@ -85,8 +86,14 @@ sealed interface UiEvent {
     /**
      * [chooser] = always show the "Open with" app chooser.
      * [uri] = optional pre-resolved [android.provider.MediaStore] or [android.provider.DocumentsContract] URI.
+     * [excludePackageInstallers] = also exclude system `PackageInstaller` activities via [android.content.Intent.EXTRA_EXCLUDE_COMPONENTS].
      */
-    data class OpenFile(val path: String, val chooser: Boolean = false, val uri: android.net.Uri? = null) : UiEvent
+    data class OpenFile(
+        val path: String,
+        val chooser: Boolean = false,
+        val uri: android.net.Uri? = null,
+        val excludePackageInstallers: Boolean = false,
+    ) : UiEvent
     data class Share(val paths: List<String>, val uris: Map<String, android.net.Uri> = emptyMap()) : UiEvent
     data class Toast(
         val message: String,
